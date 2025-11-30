@@ -18,11 +18,20 @@ logger = logging.getLogger("tg_parser")
 
 # ---------- КОНФИГ И ОКРУЖЕНИЕ ----------
 
-API_ID = int(os.getenv("TG_API_ID", "0"))
-API_HASH = os.getenv("TG_API_HASH", "")
-SESSION_STRING = os.getenv("TG_SESSION", "")
+# Пытаемся взять API_ID / API_HASH из разных вариантов переменных
+API_ID = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or "0")
+API_HASH = os.getenv("TG_API_HASH") or os.getenv("API_HASH") or ""
 
-API_BASE_URL = os.getenv("API_BASE_URL", "").rstrip("/")
+# Пытаемся взять строку сессии из нескольких имён:
+# TG_SESSION / TELEGRAM_SESSION / SESSION
+SESSION_STRING = (
+    os.getenv("TG_SESSION")
+    or os.getenv("TELEGRAM_SESSION")
+    or os.getenv("SESSION")
+    or ""
+)
+
+API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
 if not API_BASE_URL:
     # пример: https://telegram-job-parser-production.up.railway.app
     API_BASE_URL = "https://telegram-job-parser-production.up.railway.app"
@@ -32,9 +41,15 @@ API_SECRET = os.getenv("API_SECRET", "")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))  # дефолт 5 минут
 MESSAGES_LIMIT_PER_SOURCE = int(os.getenv("MESSAGES_LIMIT_PER_SOURCE", "50"))
 
-if not API_ID or not API_HASH or not SESSION_STRING:
-    logger.error("❌ TG_API_ID / TG_API_HASH / TG_SESSION не заданы в переменных окружения")
-    # Не выходим жёстко, но дальше всё равно не взлетит
+if not API_ID or not API_HASH:
+    logger.error("❌ TG_API_ID/API_ID или TG_API_HASH/API_HASH не заданы в переменных окружения")
+
+if not SESSION_STRING:
+    logger.error(
+        "❌ Не найдена строка сессии Telegram. "
+        "Установи одну из переменных: TG_SESSION, TELEGRAM_SESSION или SESSION"
+    )
+
 # ---------- КЛЮЧЕВЫЕ СЛОВА ----------
 
 KEYWORDS = [
@@ -180,7 +195,6 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
     # Забираем последние N сообщений
     try:
         async for message in client.iter_messages(entity, limit=MESSAGES_LIMIT_PER_SOURCE):
-            # Тележка умеет слать сервисные/медийные сообщения без текста
             text = message.message or ""
             if not text:
                 continue
@@ -188,26 +202,20 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
             if not is_relevant_by_keywords(text):
                 continue
 
-            # Временная метка
             created_at: datetime = message.date
-            # date у Telethon в UTC
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
 
-            # external_id: достаточно id сообщения; миниапп ещё учитывает поле source
             external_id = str(message.id)
 
-            # Линк на сообщение, если есть username
             if channel_username:
                 msg_link = f"https://t.me/{channel_username}/{message.id}"
             else:
-                # fallback: ссылка на сам канал
                 if source.startswith("http://") or source.startswith("https://"):
                     msg_link = source
                 else:
                     msg_link = f"https://t.me/{normalized}"
 
-            # username автора, чтобы сделать "Написать автору"
             sender_username = None
             try:
                 if message.sender and getattr(message.sender, "username", None):
@@ -240,18 +248,35 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
 # ---------- ОСНОВНОЙ ЦИКЛ ----------
 
 async def run_loop_async():
-    if not API_ID or not API_HASH or not SESSION_STRING:
-        logger.error("❌ Нет конфигурации Telegram клиента, выходим из цикла.")
+    if not API_ID or not API_HASH:
+        logger.error("❌ Нет конфигурации Telegram клиента (API_ID/API_HASH), выходим.")
         return
 
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    if not SESSION_STRING:
+        logger.error(
+            "❌ Нет строки сессии Telegram. "
+            "Установи TG_SESSION / TELEGRAM_SESSION / SESSION в Railway (StringSession)."
+        )
+        return
+
+    # Пытаемся создать StringSession, если строка кривая — не падаем в traceback, а логируем
+    try:
+        session_obj = StringSession(SESSION_STRING)
+    except ValueError:
+        logger.error(
+            "❌ Некорректная строка сессии Telegram. "
+            "Переменная TG_SESSION/TELEGRAM_SESSION/SESSION не является валидным StringSession. "
+            "Нужно заново сгенерировать StringSession локально через Telethon."
+        )
+        return
+
+    client = TelegramClient(session_obj, API_ID, API_HASH)
 
     async with client:
-        # Явно подключаемся
         await client.connect()
 
         if not await client.is_user_authorized():
-            logger.error("❌ Telegram клиент не авторизован. Проверь TG_SESSION / TG_API_ID / TG_API_HASH")
+            logger.error("❌ Telegram клиент не авторизован. Проверь StringSession / API_ID / API_HASH")
             return
 
         logger.info("✅ Telegram клиент подключён и авторизован")
@@ -276,7 +301,6 @@ async def run_loop_async():
 
                 except Exception as e:
                     logger.error("❌ Неожиданная ошибка в основном цикле: %s", e)
-                    # Немного отдыха, чтобы не крутить бешеный цикл при фатальных ошибках
                     await asyncio.sleep(10)
 
 
