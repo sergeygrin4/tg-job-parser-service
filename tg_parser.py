@@ -138,6 +138,24 @@ def is_relevant_by_keywords(text: str | None) -> bool:
     return any(kw in t for kw in KEYWORDS_LOWER)
 
 
+# ---------- АЛЕРТЫ ДЛЯ ТГ ----------
+
+def send_alert(text: str):
+    try:
+        requests.post(
+            f"{API_BASE_URL}/api/alert",
+            headers={"X-API-SECRET": API_SECRET},
+            json={
+                "source": "tg_parser",
+                "message": text,
+            },
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+
 # ---------- ПАРСИНГ ОДНОГО ИСТОЧНИКА ----------
 
 async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, source: str):
@@ -172,7 +190,20 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
         await asyncio.sleep(e.seconds)
         return
     except RPCError as e:
-        logger.error("❌ RPCError при получении entity %s: %s", source, e)
+        logger.error(
+    "❌ RPCError при получении entity %s: %s",
+    source,
+    e
+)
+
+if "authorization has been invalidated" in str(e).lower():
+    send_alert(
+        "Telegram парсер потерял авторизацию.\n"
+        "Аккаунт выбило из сессии.\n"
+        "Нужно перелогиниться и пересоздать session.\n\n"
+        f"Источник: {source}"
+    )
+
         return
     except Exception as e:
         logger.error("❌ Ошибка при получении entity для %s: %s", source, e)
