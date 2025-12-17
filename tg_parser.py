@@ -167,10 +167,17 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
         await client.connect()
         if not await client.is_user_authorized():
             logger.error("❌ Клиент Telegram не авторизован после переподключения")
+
+            send_alert(
+                "Telegram парсер потерял авторизацию.\n"
+                "Клиент не авторизован после переподключения.\n"
+                "Нужно перелогиниться и пересоздать session.\n\n"
+                f"Источник: {source}"
+            )
             return
 
+    # ---------- Получение entity ----------
     try:
-        # source может быть @username или https://t.me/....
         normalized = source.strip()
         if normalized.startswith("https://t.me/"):
             normalized = normalized.replace("https://t.me/", "")
@@ -178,52 +185,81 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
             normalized = normalized.replace("http://t.me/", "")
         normalized = normalized.rstrip("/")
 
-        # Для get_entity оставим либо @username, либо shortname
         if normalized and not normalized.startswith("@"):
             normalized_for_entity = normalized
         else:
             normalized_for_entity = normalized
 
         entity = await client.get_entity(normalized_for_entity)
+
     except FloodWaitError as e:
-        logger.error("⏳ FloodWaitError при получении entity %s: нужно подождать %s секунд", source, e.seconds)
+        logger.error(
+            "⏳ FloodWaitError при получении entity %s: нужно подождать %s секунд",
+            source,
+            e.seconds,
+        )
+
+        send_alert(
+            "Telegram временно ограничил запросы (FloodWait).\n"
+            f"Нужно подождать {e.seconds} секунд.\n\n"
+            f"Источник: {source}"
+        )
+
         await asyncio.sleep(e.seconds)
         return
+
     except RPCError as e:
         logger.error(
-    "❌ RPCError при получении entity %s: %s",
-    source,
-    e
-)
+            "❌ RPCError при получении entity %s: %s",
+            source,
+            e,
+        )
 
-if "authorization has been invalidated" in str(e).lower():
-    send_alert(
-        "Telegram парсер потерял авторизацию.\n"
-        "Аккаунт выбило из сессии.\n"
-        "Нужно перелогиниться и пересоздать session.\n\n"
-        f"Источник: {source}"
-    )
+        error_text = str(e).lower()
+
+        if "authorization has been invalidated" in error_text:
+            send_alert(
+                "Telegram парсер потерял авторизацию.\n"
+                "Аккаунт выбило из сессии.\n"
+                "Нужно перелогиниться и пересоздать session.\n\n"
+                f"Источник: {source}"
+            )
+        else:
+            send_alert(
+                "Ошибка Telegram парсера при получении entity.\n\n"
+                f"Источник: {source}\n"
+                f"Ошибка: {e}"
+            )
 
         return
+
     except Exception as e:
-        logger.error("❌ Ошибка при получении entity для %s: %s", source, e)
+        logger.error(
+            "❌ Ошибка при получении entity для %s: %s",
+            source,
+            e,
+        )
+
+        send_alert(
+            "Неожиданная ошибка Telegram парсера при получении entity.\n\n"
+            f"Источник: {source}\n"
+            f"Ошибка: {e}"
+        )
+
         return
 
-    # Пытаемся достать username канала/группы для построения ссылки
-    channel_username = None
+    # ---------- Данные источника ----------
     try:
         channel_username = getattr(entity, "username", None)
     except Exception:
         channel_username = None
 
-    # Название источника
-    channel_title = None
     try:
         channel_title = getattr(entity, "title", None) or getattr(entity, "first_name", None)
     except Exception:
         channel_title = None
 
-    # Забираем последние N сообщений
+    # ---------- Чтение сообщений ----------
     try:
         async for message in client.iter_messages(entity, limit=MESSAGES_LIMIT_PER_SOURCE):
             text = message.message or ""
@@ -264,16 +300,54 @@ if "authorization has been invalidated" in str(e).lower():
                 "created_at": created_at.isoformat(),
             }
 
-            logger.info("📨 Найден релевантный пост в %s (id=%s), отправляем в миниапп", source, external_id)
+            logger.info(
+                "📨 Найден релевантный пост в %s (id=%s), отправляем в миниапп",
+                source,
+                external_id,
+            )
+
             await send_post(session, payload)
 
     except FloodWaitError as e:
-        logger.error("⏳ FloodWaitError при чтении истории %s: нужно подождать %s секунд", source, e.seconds)
+        logger.error(
+            "⏳ FloodWaitError при чтении истории %s: нужно подождать %s секунд",
+            source,
+            e.seconds,
+        )
+
+        send_alert(
+            "Telegram временно ограничил чтение истории (FloodWait).\n"
+            f"Нужно подождать {e.seconds} секунд.\n\n"
+            f"Источник: {source}"
+        )
+
         await asyncio.sleep(e.seconds)
+
     except RPCError as e:
-        logger.error("❌ RPCError при чтении истории %s: %s", source, e)
+        logger.error(
+            "❌ RPCError при чтении истории %s: %s",
+            source,
+            e,
+        )
+
+        send_alert(
+            "Ошибка Telegram парсера при чтении истории.\n\n"
+            f"Источник: {source}\n"
+            f"Ошибка: {e}"
+        )
+
     except Exception as e:
-        logger.error("❌ Неожиданная ошибка при парсинге источника %s: %s", source, e)
+        logger.error(
+            "❌ Неожиданная ошибка при парсинге источника %s: %s",
+            source,
+            e,
+        )
+
+        send_alert(
+            "Критическая ошибка Telegram парсера при парсинге источника.\n\n"
+            f"Источник: {source}\n"
+            f"Ошибка: {e}"
+        )
 
 
 # ---------- ОСНОВНОЙ ЦИКЛ ----------
