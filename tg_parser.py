@@ -415,4 +415,23 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except EOFError as e:
+        send_alert(
+            "🚨 Telegram парсер потерял сессию.\n\n"
+            "Telegram выбил аккаунт из всех сессий.\n"
+            "Telethon попытался запросить телефон,\n"
+            "но это headless-среда (Railway).\n\n"
+            "❗ Требуется действие:\n"
+            "- пересоздать Telegram StringSession\n"
+            "- обновить TG_STRING_SESSION в Railway\n"
+        )
+        raise
+    except Exception as e:
+        send_alert(
+            "🚨 Критическая ошибка запуска Telegram парсера.\n\n"
+            f"Ошибка: {e}"
+        )
+        raise
+
