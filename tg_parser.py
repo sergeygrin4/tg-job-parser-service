@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import os
+import json
 from datetime import datetime, timezone
+from urllib import request as urllib_request
+from urllib.error import URLError, HTTPError
 
 import aiohttp
-import requests
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import RPCError, FloodWaitError
@@ -19,12 +21,9 @@ logger = logging.getLogger("tg_parser")
 
 # ---------- КОНФИГ И ОКРУЖЕНИЕ ----------
 
-# Пытаемся взять API_ID / API_HASH из разных вариантов переменных
 API_ID = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or "0")
 API_HASH = os.getenv("TG_API_HASH") or os.getenv("API_HASH") or ""
 
-# Пытаемся взять строку сессии из нескольких имён:
-# TG_SESSION / TELEGRAM_SESSION / SESSION
 SESSION_STRING = (
     os.getenv("TG_SESSION")
     or os.getenv("TELEGRAM_SESSION")
@@ -34,12 +33,12 @@ SESSION_STRING = (
 
 API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
 if not API_BASE_URL:
-    # пример: https://telegram-job-parser-production.up.railway.app
+    # оставь как у тебя было или удали дефолт и задай в env
     API_BASE_URL = "https://telegram-job-parser-production.up.railway.app"
 
 API_SECRET = os.getenv("API_SECRET", "")
 
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))  # дефолт 5 минут
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 MESSAGES_LIMIT_PER_SOURCE = int(os.getenv("MESSAGES_LIMIT_PER_SOURCE", "50"))
 
 if not API_ID or not API_HASH:
@@ -54,7 +53,7 @@ if not SESSION_STRING:
 # ---------- КЛЮЧЕВЫЕ СЛОВА ----------
 
 KEYWORDS = [
-    # Русские
+    # RU
     "вакансия", "вакансии", "ищем", "требуется", "нужен сотрудник", "нужна помощь", "нужен человек",
     "нужен помощник", "нужна помощница", "нужен ассистент", "нужен менеджер", "ищу исполнителя",
     "ищу помощника", "ищу сотрудника", "ищу ассистента", "в команду", "в нашу команду", "к нам в команду",
@@ -62,7 +61,7 @@ KEYWORDS = [
     "удаленка", "фриланс", "ищу на фриланс", "ищу специалиста", "ищу человека", "ищем специалиста",
     "ищем в команду", "хочу нанять", "возьму на проект", "нужен человек в проект", "ищем на проект",
     "набор сотрудников", "расширяем команду",
-    # Английские
+    # EN
     "we are hiring", "hiring", "looking for", "we’re looking for", "need help with", "need a person",
     "need an assistant", "looking for a team member", "freelancer needed", "remote position",
     "job offer", "job opening", "open position", "apply now", "join our team", "recruiting",
@@ -75,23 +74,47 @@ KEYWORDS_LOWER = [k.lower() for k in KEYWORDS]
 
 # ---------- HTTP-УТИЛИТЫ ----------
 
-def _headers():
+def _auth_headers() -> dict:
     headers = {"Content-Type": "application/json"}
     if API_SECRET:
         headers["X-API-KEY"] = API_SECRET
     return headers
 
 
+def send_alert(text: str):
+    """
+    Системный алерт в миниапп: POST /api/alert
+    Без requests, только urllib (stdlib).
+    """
+    try:
+        url = f"{API_BASE_URL}/api/alert"
+        payload = json.dumps({"source": "tg_parser", "message": text}).encode("utf-8")
+
+        req = urllib_request.Request(url, data=payload, method="POST")
+        req.add_header("Content-Type", "application/json")
+        if API_SECRET:
+            req.add_header("X-API-KEY", API_SECRET)
+
+        with urllib_request.urlopen(req, timeout=10) as resp:
+            _ = resp.read()
+
+    except (HTTPError, URLError, TimeoutError):
+        # алерт не должен валить парсер
+        pass
+    except Exception:
+        pass
+
+
 async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
     """
-    Берём источники из миниаппа: GET /api/groups
-    Ожидаем ответ вида: {"groups": [{"group_id": "...", ...}, ...]}
+    GET /api/groups
+    Ожидаем {"groups":[{"group_id":"..."}, ...]}
     """
     url = f"{API_BASE_URL}/api/groups"
     try:
         async with session.get(url, timeout=10) as resp:
             if resp.status != 200:
-                logger.error("❌ Ошибка запроса /api/groups: %s %s", resp.status, await resp.text())
+                logger.error("❌ Ошибка /api/groups: %s %s", resp.status, await resp.text())
                 return []
             data = await resp.json()
     except Exception as e:
@@ -106,31 +129,28 @@ async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
             sources.append(gid)
 
     if sources:
-        logger.info("📥 Получено %d Telegram-источников из БД: %s", len(sources), sources)
+        logger.info("📥 Получено %d Telegram-источников: %s", len(sources), sources)
     else:
-        logger.info("📥 Источников из /api/groups не найдено")
+        logger.info("📥 Источников в /api/groups не найдено")
 
     return sources
 
 
 async def send_post(session: aiohttp.ClientSession, payload: dict):
     """
-    Отправка вакансии в миниапп: POST /post
-    Миниапп уже сам делает AI-фильтр и дубликаты.
+    POST /post
     """
     url = f"{API_BASE_URL}/post"
     try:
-        async with session.post(url, json=payload, headers=_headers(), timeout=15) as resp:
+        async with session.post(url, json=payload, headers=_auth_headers(), timeout=15) as resp:
             text = await resp.text()
             if resp.status != 200:
-                logger.error("❌ Ошибка отправки поста (%s): %s %s", url, resp.status, text)
+                logger.error("❌ Ошибка /post: %s %s", resp.status, text)
                 return
             logger.info("✅ Пост отправлен в миниапп: %s", text)
     except Exception as e:
         logger.error("❌ Ошибка HTTP при отправке поста: %s", e)
 
-
-# ---------- ЛОГИКА ФИЛЬТРАЦИИ ----------
 
 def is_relevant_by_keywords(text: str | None) -> bool:
     if not text:
@@ -139,50 +159,23 @@ def is_relevant_by_keywords(text: str | None) -> bool:
     return any(kw in t for kw in KEYWORDS_LOWER)
 
 
-# ---------- АЛЕРТЫ ДЛЯ ТГ ----------
-
-def send_alert(text: str):
-    """Отправляет системный алерт в миниапп (который дальше шлёт в Telegram ботом)."""
-    try:
-        headers = {"Content-Type": "application/json"}
-        if API_SECRET:
-            headers["X-API-KEY"] = API_SECRET
-
-        requests.post(
-            f"{API_BASE_URL}/api/alert",
-            headers=headers,
-            json={
-                "source": "tg_parser",
-                "message": text,
-            },
-            timeout=10,
-        )
-    except Exception:
-        # алерт не должен валить парсер
-        pass
-
-
-# ---------- ПАРСИНГ ОДНОГО ИСТОЧНИКА ----------
-
 async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, source: str):
     logger.info("🔍 Парсим Telegram источник: %s", source)
 
-    # Если клиент по какой-то причине отвалился — переподключаем
     if not client.is_connected():
-        logger.warning("⚠️ Клиент Telegram отключён, пробуем подключиться заново...")
+        logger.warning("⚠️ Клиент Telegram отключён, переподключаем...")
         await client.connect()
         if not await client.is_user_authorized():
             logger.error("❌ Клиент Telegram не авторизован после переподключения")
-
             send_alert(
                 "Telegram парсер потерял авторизацию.\n"
                 "Клиент не авторизован после переподключения.\n"
-                "Нужно перелогиниться и пересоздать session.\n\n"
+                "Нужно пересоздать session.\n\n"
                 f"Источник: {source}"
             )
             return
 
-    # ---------- Получение entity ----------
+    # entity
     try:
         normalized = source.strip()
         if normalized.startswith("https://t.me/"):
@@ -191,54 +184,32 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
             normalized = normalized.replace("http://t.me/", "")
         normalized = normalized.rstrip("/")
 
-        normalized_for_entity = normalized
-        entity = await client.get_entity(normalized_for_entity)
+        entity = await client.get_entity(normalized)
 
     except FloodWaitError as e:
-        logger.error(
-            "⏳ FloodWaitError при получении entity %s: нужно подождать %s секунд",
-            source,
-            e.seconds,
-        )
-
-        send_alert(
-            "Telegram временно ограничил запросы (FloodWait).\n"
-            f"Нужно подождать {e.seconds} секунд.\n\n"
-            f"Источник: {source}"
-        )
-
+        logger.error("⏳ FloodWait при get_entity %s: %s sec", source, e.seconds)
+        send_alert(f"Telegram FloodWait (get_entity). Ждать {e.seconds} сек.\n\nИсточник: {source}")
         await asyncio.sleep(e.seconds)
         return
 
     except RPCError as e:
-        logger.error("❌ RPCError при получении entity %s: %s", source, e)
-
-        error_text = str(e).lower()
-        if "authorization has been invalidated" in error_text:
+        logger.error("❌ RPCError при get_entity %s: %s", source, e)
+        if "authorization has been invalidated" in str(e).lower():
             send_alert(
-                "Telegram парсер потерял авторизацию.\n"
-                "Аккаунт выбило из сессии.\n"
-                "Нужно перелогиниться и пересоздать session.\n\n"
+                "Telegram парсер потерял авторизацию (authorization invalidated).\n"
+                "Нужно пересоздать session.\n\n"
                 f"Источник: {source}"
             )
         else:
-            send_alert(
-                "Ошибка Telegram парсера при получении entity.\n\n"
-                f"Источник: {source}\n"
-                f"Ошибка: {e}"
-            )
+            send_alert(f"Ошибка Telegram парсера при получении entity.\nИсточник: {source}\nОшибка: {e}")
         return
 
     except Exception as e:
-        logger.error("❌ Ошибка при получении entity для %s: %s", source, e)
-        send_alert(
-            "Неожиданная ошибка Telegram парсера при получении entity.\n\n"
-            f"Источник: {source}\n"
-            f"Ошибка: {e}"
-        )
+        logger.error("❌ Ошибка при get_entity %s: %s", source, e)
+        send_alert(f"Неожиданная ошибка при получении entity.\nИсточник: {source}\nОшибка: {e}")
         return
 
-    # ---------- Данные источника ----------
+    # info
     try:
         channel_username = getattr(entity, "username", None)
     except Exception:
@@ -249,7 +220,7 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
     except Exception:
         channel_title = None
 
-    # ---------- Чтение сообщений ----------
+    # messages
     try:
         async for message in client.iter_messages(entity, limit=MESSAGES_LIMIT_PER_SOURCE):
             text = message.message or ""
@@ -268,10 +239,7 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
             if channel_username:
                 msg_link = f"https://t.me/{channel_username}/{message.id}"
             else:
-                if source.startswith("http://") or source.startswith("https://"):
-                    msg_link = source
-                else:
-                    msg_link = f"https://t.me/{normalized}"
+                msg_link = f"https://t.me/{normalized}"
 
             sender_username = None
             try:
@@ -290,56 +258,39 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
                 "created_at": created_at.isoformat(),
             }
 
-            logger.info("📨 Найден релевантный пост в %s (id=%s), отправляем в миниапп", source, external_id)
+            logger.info("📨 Релевантный пост в %s (id=%s) → отправляем", source, external_id)
             await send_post(session, payload)
 
     except FloodWaitError as e:
-        logger.error("⏳ FloodWaitError при чтении истории %s: нужно подождать %s секунд", source, e.seconds)
-        send_alert(
-            "Telegram временно ограничил чтение истории (FloodWait).\n"
-            f"Нужно подождать {e.seconds} секунд.\n\n"
-            f"Источник: {source}"
-        )
+        logger.error("⏳ FloodWait при iter_messages %s: %s sec", source, e.seconds)
+        send_alert(f"Telegram FloodWait (iter_messages). Ждать {e.seconds} сек.\n\nИсточник: {source}")
         await asyncio.sleep(e.seconds)
 
     except RPCError as e:
-        logger.error("❌ RPCError при чтении истории %s: %s", source, e)
-        send_alert(
-            "Ошибка Telegram парсера при чтении истории.\n\n"
-            f"Источник: {source}\n"
-            f"Ошибка: {e}"
-        )
+        logger.error("❌ RPCError при iter_messages %s: %s", source, e)
+        send_alert(f"Ошибка Telegram парсера при чтении истории.\nИсточник: {source}\nОшибка: {e}")
 
     except Exception as e:
-        logger.error("❌ Неожиданная ошибка при парсинге источника %s: %s", source, e)
-        send_alert(
-            "Критическая ошибка Telegram парсера при парсинге источника.\n\n"
-            f"Источник: {source}\n"
-            f"Ошибка: {e}"
-        )
+        logger.error("❌ Ошибка парсинга %s: %s", source, e)
+        send_alert(f"Критическая ошибка Telegram парсера при парсинге.\nИсточник: {source}\nОшибка: {e}")
 
-
-# ---------- ОСНОВНОЙ ЦИКЛ ----------
 
 async def run_loop_async():
     if not API_ID or not API_HASH:
-        logger.error("❌ Нет конфигурации Telegram клиента (API_ID/API_HASH), выходим.")
+        logger.error("❌ Нет Telegram конфигурации (API_ID/API_HASH), выходим.")
         return
 
     if not SESSION_STRING:
-        logger.error(
-            "❌ Нет строки сессии Telegram. "
-            "Установи TG_SESSION / TELEGRAM_SESSION / SESSION в Railway (StringSession)."
-        )
+        logger.error("❌ Нет StringSession в TG_SESSION/TELEGRAM_SESSION/SESSION, выходим.")
         return
 
     try:
         session_obj = StringSession(SESSION_STRING)
     except ValueError:
-        logger.error(
-            "❌ Некорректная строка сессии Telegram. "
-            "Переменная TG_SESSION/TELEGRAM_SESSION/SESSION не является валидным StringSession. "
-            "Нужно заново сгенерировать StringSession локально через Telethon."
+        logger.error("❌ Некорректная строка StringSession (TG_SESSION/TELEGRAM_SESSION/SESSION)")
+        send_alert(
+            "Telegram парсер не стартовал: некорректная StringSession.\n"
+            "Нужно пересоздать StringSession и обновить переменную в Railway."
         )
         return
 
@@ -349,11 +300,11 @@ async def run_loop_async():
         await client.connect()
 
         if not await client.is_user_authorized():
-            logger.error("❌ Telegram клиент не авторизован. Проверь StringSession / API_ID / API_HASH")
+            logger.error("❌ Telegram клиент НЕ авторизован (StringSession слетела?)")
             send_alert(
                 "Telegram парсер не смог стартовать: клиент НЕ авторизован.\n\n"
-                "Похоже, сессия слетела или строка StringSession невалидна.\n"
-                "Нужно пересоздать StringSession и обновить переменную TG_SESSION (или TELEGRAM_SESSION/SESSION) в Railway."
+                "Похоже, сессия слетела/невалидна.\n"
+                "Нужно пересоздать StringSession и обновить TG_SESSION (или TELEGRAM_SESSION/SESSION)."
             )
             return
 
@@ -372,13 +323,13 @@ async def run_loop_async():
                         try:
                             await parse_source(client, session, source)
                         except Exception as e:
-                            logger.error("❌ Ошибка при парсинге источника %s: %s", source, e)
+                            logger.error("❌ Ошибка парсинга источника %s: %s", source, e)
 
                     logger.info("⏳ Ждём %s секунд до следующего цикла", POLL_INTERVAL_SECONDS)
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
                 except Exception as e:
-                    logger.error("❌ Неожиданная ошибка в основном цикле: %s", e)
+                    logger.error("❌ Ошибка в основном цикле: %s", e)
                     await asyncio.sleep(10)
 
 
@@ -393,17 +344,10 @@ if __name__ == "__main__":
     except EOFError:
         send_alert(
             "🚨 Telegram парсер потерял сессию.\n\n"
-            "Telegram выбил аккаунт из всех сессий.\n"
-            "Telethon попытался запросить телефон,\n"
-            "но это headless-среда (Railway).\n\n"
-            "❗ Требуется действие:\n"
-            "- пересоздать Telegram StringSession\n"
-            "- обновить TG_SESSION (или TELEGRAM_SESSION/SESSION) в Railway\n"
+            "Telethon попытался запросить ввод (телефон/код), но это headless среда.\n"
+            "Нужно пересоздать StringSession и обновить переменную TG_SESSION."
         )
         raise
     except Exception as e:
-        send_alert(
-            "🚨 Критическая ошибка запуска Telegram парсера.\n\n"
-            f"Ошибка: {e}"
-        )
+        send_alert(f"🚨 Критическая ошибка запуска Telegram парсера.\n\nОшибка: {e}")
         raise
