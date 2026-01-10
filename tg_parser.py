@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timezone
 
 import aiohttp
+import requests
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import RPCError, FloodWaitError
@@ -141,10 +142,15 @@ def is_relevant_by_keywords(text: str | None) -> bool:
 # ---------- АЛЕРТЫ ДЛЯ ТГ ----------
 
 def send_alert(text: str):
+    """Отправляет системный алерт в миниапп (который дальше шлёт в Telegram ботом)."""
     try:
+        headers = {"Content-Type": "application/json"}
+        if API_SECRET:
+            headers["X-API-KEY"] = API_SECRET
+
         requests.post(
             f"{API_BASE_URL}/api/alert",
-            headers={"X-API-SECRET": API_SECRET},
+            headers=headers,
             json={
                 "source": "tg_parser",
                 "message": text,
@@ -152,8 +158,8 @@ def send_alert(text: str):
             timeout=10,
         )
     except Exception:
+        # алерт не должен валить парсер
         pass
-
 
 
 # ---------- ПАРСИНГ ОДНОГО ИСТОЧНИКА ----------
@@ -185,11 +191,7 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
             normalized = normalized.replace("http://t.me/", "")
         normalized = normalized.rstrip("/")
 
-        if normalized and not normalized.startswith("@"):
-            normalized_for_entity = normalized
-        else:
-            normalized_for_entity = normalized
-
+        normalized_for_entity = normalized
         entity = await client.get_entity(normalized_for_entity)
 
     except FloodWaitError as e:
@@ -209,14 +211,9 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
         return
 
     except RPCError as e:
-        logger.error(
-            "❌ RPCError при получении entity %s: %s",
-            source,
-            e,
-        )
+        logger.error("❌ RPCError при получении entity %s: %s", source, e)
 
         error_text = str(e).lower()
-
         if "authorization has been invalidated" in error_text:
             send_alert(
                 "Telegram парсер потерял авторизацию.\n"
@@ -230,22 +227,15 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
                 f"Источник: {source}\n"
                 f"Ошибка: {e}"
             )
-
         return
 
     except Exception as e:
-        logger.error(
-            "❌ Ошибка при получении entity для %s: %s",
-            source,
-            e,
-        )
-
+        logger.error("❌ Ошибка при получении entity для %s: %s", source, e)
         send_alert(
             "Неожиданная ошибка Telegram парсера при получении entity.\n\n"
             f"Источник: {source}\n"
             f"Ошибка: {e}"
         )
-
         return
 
     # ---------- Данные источника ----------
@@ -300,36 +290,20 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
                 "created_at": created_at.isoformat(),
             }
 
-            logger.info(
-                "📨 Найден релевантный пост в %s (id=%s), отправляем в миниапп",
-                source,
-                external_id,
-            )
-
+            logger.info("📨 Найден релевантный пост в %s (id=%s), отправляем в миниапп", source, external_id)
             await send_post(session, payload)
 
     except FloodWaitError as e:
-        logger.error(
-            "⏳ FloodWaitError при чтении истории %s: нужно подождать %s секунд",
-            source,
-            e.seconds,
-        )
-
+        logger.error("⏳ FloodWaitError при чтении истории %s: нужно подождать %s секунд", source, e.seconds)
         send_alert(
             "Telegram временно ограничил чтение истории (FloodWait).\n"
             f"Нужно подождать {e.seconds} секунд.\n\n"
             f"Источник: {source}"
         )
-
         await asyncio.sleep(e.seconds)
 
     except RPCError as e:
-        logger.error(
-            "❌ RPCError при чтении истории %s: %s",
-            source,
-            e,
-        )
-
+        logger.error("❌ RPCError при чтении истории %s: %s", source, e)
         send_alert(
             "Ошибка Telegram парсера при чтении истории.\n\n"
             f"Источник: {source}\n"
@@ -337,12 +311,7 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
         )
 
     except Exception as e:
-        logger.error(
-            "❌ Неожиданная ошибка при парсинге источника %s: %s",
-            source,
-            e,
-        )
-
+        logger.error("❌ Неожиданная ошибка при парсинге источника %s: %s", source, e)
         send_alert(
             "Критическая ошибка Telegram парсера при парсинге источника.\n\n"
             f"Источник: {source}\n"
@@ -364,7 +333,6 @@ async def run_loop_async():
         )
         return
 
-    # Пытаемся создать StringSession, если строка кривая — не падаем в traceback, а логируем
     try:
         session_obj = StringSession(SESSION_STRING)
     except ValueError:
@@ -382,6 +350,11 @@ async def run_loop_async():
 
         if not await client.is_user_authorized():
             logger.error("❌ Telegram клиент не авторизован. Проверь StringSession / API_ID / API_HASH")
+            send_alert(
+                "Telegram парсер не смог стартовать: клиент НЕ авторизован.\n\n"
+                "Похоже, сессия слетела или строка StringSession невалидна.\n"
+                "Нужно пересоздать StringSession и обновить переменную TG_SESSION (или TELEGRAM_SESSION/SESSION) в Railway."
+            )
             return
 
         logger.info("✅ Telegram клиент подключён и авторизован")
@@ -417,7 +390,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except EOFError as e:
+    except EOFError:
         send_alert(
             "🚨 Telegram парсер потерял сессию.\n\n"
             "Telegram выбил аккаунт из всех сессий.\n"
@@ -425,7 +398,7 @@ if __name__ == "__main__":
             "но это headless-среда (Railway).\n\n"
             "❗ Требуется действие:\n"
             "- пересоздать Telegram StringSession\n"
-            "- обновить TG_STRING_SESSION в Railway\n"
+            "- обновить TG_SESSION (или TELEGRAM_SESSION/SESSION) в Railway\n"
         )
         raise
     except Exception as e:
@@ -434,4 +407,3 @@ if __name__ == "__main__":
             f"Ошибка: {e}"
         )
         raise
-
