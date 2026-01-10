@@ -33,7 +33,7 @@ SESSION_STRING = (
 
 API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
 if not API_BASE_URL:
-    # оставь как у тебя было или удали дефолт и задай в env
+    # ВАЖНО: лучше всегда задавать API_BASE_URL в env.
     API_BASE_URL = "https://telegram-job-parser-production.up.railway.app"
 
 API_SECRET = os.getenv("API_SECRET", "")
@@ -99,7 +99,6 @@ def send_alert(text: str):
             _ = resp.read()
 
     except (HTTPError, URLError, TimeoutError):
-        # алерт не должен валить парсер
         pass
     except Exception:
         pass
@@ -165,15 +164,17 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
     if not client.is_connected():
         logger.warning("⚠️ Клиент Telegram отключён, переподключаем...")
         await client.connect()
-        if not await client.is_user_authorized():
-            logger.error("❌ Клиент Telegram не авторизован после переподключения")
-            send_alert(
-                "Telegram парсер потерял авторизацию.\n"
-                "Клиент не авторизован после переподключения.\n"
-                "Нужно пересоздать session.\n\n"
-                f"Источник: {source}"
-            )
-            return
+
+    # Если слетела авторизация — не пытаемся интерактивно логиниться, просто алерт
+    if not await client.is_user_authorized():
+        logger.error("❌ Клиент Telegram НЕ авторизован (сессия слетела)")
+        send_alert(
+            "Telegram парсер: сессия не авторизована.\n"
+            "Railway не может спросить телефон/код.\n\n"
+            "Нужно пересоздать StringSession и обновить TG_SESSION.\n"
+            f"Источник (при попытке парсинга): {source}"
+        )
+        return
 
     # entity
     try:
@@ -197,7 +198,7 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
         if "authorization has been invalidated" in str(e).lower():
             send_alert(
                 "Telegram парсер потерял авторизацию (authorization invalidated).\n"
-                "Нужно пересоздать session.\n\n"
+                "Нужно пересоздать StringSession и обновить TG_SESSION.\n\n"
                 f"Источник: {source}"
             )
         else:
@@ -268,7 +269,14 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
 
     except RPCError as e:
         logger.error("❌ RPCError при iter_messages %s: %s", source, e)
-        send_alert(f"Ошибка Telegram парсера при чтении истории.\nИсточник: {source}\nОшибка: {e}")
+        if "authorization has been invalidated" in str(e).lower():
+            send_alert(
+                "Telegram парсер потерял авторизацию (authorization invalidated) во время чтения.\n"
+                "Нужно пересоздать StringSession и обновить TG_SESSION.\n\n"
+                f"Источник: {source}"
+            )
+        else:
+            send_alert(f"Ошибка Telegram парсера при чтении истории.\nИсточник: {source}\nОшибка: {e}")
 
     except Exception as e:
         logger.error("❌ Ошибка парсинга %s: %s", source, e)
@@ -282,6 +290,10 @@ async def run_loop_async():
 
     if not SESSION_STRING:
         logger.error("❌ Нет StringSession в TG_SESSION/TELEGRAM_SESSION/SESSION, выходим.")
+        send_alert(
+            "Telegram парсер не стартовал: не задана StringSession.\n"
+            "Нужно задать TG_SESSION (StringSession) в Railway."
+        )
         return
 
     try:
@@ -290,25 +302,27 @@ async def run_loop_async():
         logger.error("❌ Некорректная строка StringSession (TG_SESSION/TELEGRAM_SESSION/SESSION)")
         send_alert(
             "Telegram парсер не стартовал: некорректная StringSession.\n"
-            "Нужно пересоздать StringSession и обновить переменную в Railway."
+            "Нужно пересоздать StringSession и обновить TG_SESSION."
         )
         return
 
     client = TelegramClient(session_obj, API_ID, API_HASH)
 
-    async with client:
+    try:
         await client.connect()
+        logger.info("✅ Подключились к Telegram (connect)")
 
+        # КЛЮЧЕВОЕ: никакого client.start() — только проверка авторизации
         if not await client.is_user_authorized():
-            logger.error("❌ Telegram клиент НЕ авторизован (StringSession слетела?)")
+            logger.error("❌ Telegram клиент НЕ авторизован (StringSession слетела/не подходит)")
             send_alert(
                 "Telegram парсер не смог стартовать: клиент НЕ авторизован.\n\n"
-                "Похоже, сессия слетела/невалидна.\n"
+                "Railway не может спросить телефон/код.\n"
                 "Нужно пересоздать StringSession и обновить TG_SESSION (или TELEGRAM_SESSION/SESSION)."
             )
             return
 
-        logger.info("✅ Telegram клиент подключён и авторизован")
+        logger.info("✅ Telegram клиент авторизован")
 
         async with aiohttp.ClientSession() as session:
             while True:
@@ -332,9 +346,15 @@ async def run_loop_async():
                     logger.error("❌ Ошибка в основном цикле: %s", e)
                     await asyncio.sleep(10)
 
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
 
 def main():
-    logger.info("🚀 Запуск Telegram Job Parser")
+    logger.info("🚀 Запуск Telegram Job Parser (без интерактивного логина)")
     asyncio.run(run_loop_async())
 
 
@@ -342,10 +362,10 @@ if __name__ == "__main__":
     try:
         main()
     except EOFError:
+        # На всякий случай, но теперь этого быть не должно
         send_alert(
-            "🚨 Telegram парсер потерял сессию.\n\n"
-            "Telethon попытался запросить ввод (телефон/код), но это headless среда.\n"
-            "Нужно пересоздать StringSession и обновить переменную TG_SESSION."
+            "🚨 Telegram парсер упал с EOFError (где-то всё ещё запрашивался ввод).\n"
+            "Проверь, что нигде нет client.start() / async with client."
         )
         raise
     except Exception as e:
