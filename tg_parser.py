@@ -34,7 +34,7 @@ SESSION_STRING = (
 API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
 if not API_BASE_URL:
     # ВАЖНО: лучше всегда задавать API_BASE_URL в env.
-    API_BASE_URL = "https://telegram-job-parser-production.up.railway.app"
+    API_BASE_URL = "https://miniapptg-production-caaa.up.railway.app"
 
 API_SECRET = os.getenv("API_SECRET", "")
 
