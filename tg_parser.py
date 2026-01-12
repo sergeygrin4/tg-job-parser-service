@@ -34,7 +34,7 @@ SESSION_STRING = (
 API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
 if not API_BASE_URL:
     # ВАЖНО: лучше всегда задавать API_BASE_URL в env.
-    API_BASE_URL = "https://miniapptg-production-caaa.up.railway.app"
+    API_BASE_URL = "https://telegram-job-parser-production.up.railway.app"
 
 API_SECRET = os.getenv("API_SECRET", "")
 
@@ -92,8 +92,6 @@ def send_alert(text: str):
 
         req = urllib_request.Request(url, data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
-        if API_SECRET:
-            req.add_header("X-API-KEY", API_SECRET)
 
         with urllib_request.urlopen(req, timeout=10) as resp:
             _ = resp.read()
@@ -110,18 +108,48 @@ async def fetch_secret(session: aiohttp.ClientSession, key: str) -> str | None:
     try:
         async with session.get(url, headers=_auth_headers(), timeout=10) as resp:
             if resp.status != 200:
+                logger.error("❌ Ошибка /api/parser_secrets/%s: %s %s", key, resp.status, await resp.text())
                 return None
             data = await resp.json()
             value = data.get("value")
             return value if value else None
-    except Exception:
+    except Exception as e:
+        logger.error("❌ Не удалось получить секрет %s из %s: %s", key, url, e)
         return None
+
+
+def _is_telegram_source(group_id: str) -> bool:
+    """
+    Определяем, относится ли строка group_id к Telegram-источнику.
+    Отсекаем Facebook и прочие не-TG ссылки.
+    """
+    if not group_id:
+        return False
+    s = group_id.strip()
+    if not s:
+        return False
+
+    lower = s.lower()
+
+    # Явные facebook-ссылки — игнорируем в TG-парсере
+    if "facebook.com" in lower or "fb.com" in lower:
+        return False
+
+    # Классические Telegram-форматы
+    if s.startswith("@"):
+        return True
+    if "t.me/" in lower or "telegram.me/" in lower:
+        return True
+
+    # Всё остальное считаем не-TG источником
+    return False
 
 
 async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
     """
     GET /api/groups
     Ожидаем {"groups":[{"group_id":"..."}, ...]}
+    Берём только Telegram-источники, Facebook и прочие выкидываем.
     """
     url = f"{API_BASE_URL}/api/groups"
     try:
@@ -135,16 +163,25 @@ async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
         return []
 
     groups = data.get("groups") or []
-    sources = []
+    sources: list[str] = []
+    skipped: list[str] = []
+
     for g in groups:
         gid = (g.get("group_id") or "").strip()
-        if gid:
+        if not gid:
+            continue
+        if _is_telegram_source(gid):
             sources.append(gid)
+        else:
+            skipped.append(gid)
+
+    if skipped:
+        logger.info("ℹ️ Пропущены не-Telegram источники (например FB): %s", skipped)
 
     if sources:
         logger.info("📥 Получено %d Telegram-источников: %s", len(sources), sources)
     else:
-        logger.info("📥 Источников в /api/groups не найдено")
+        logger.info("📥 Telegram-источников в /api/groups не найдено")
 
     return sources
 
@@ -158,14 +195,17 @@ async def send_post(session: aiohttp.ClientSession, payload: dict):
         async with session.post(url, json=payload, headers=_auth_headers(), timeout=15) as resp:
             text = await resp.text()
             if resp.status != 200:
-                logger.error("❌ Ошибка /post: %s %s", resp.status, text)
-                return
-            logger.info("✅ Пост отправлен в миниапп: %s", text)
+                logger.error("❌ Ошибка /post: %s %s",
+                             resp.status, text[:500])
+            else:
+                logger.info("✅ Пост отправлен в миниапп: %s", text[:200])
     except Exception as e:
-        logger.error("❌ Ошибка HTTP при отправке поста: %s", e)
+        logger.error("❌ Не удалось отправить пост в %s: %s", url, e)
 
 
-def is_relevant_by_keywords(text: str | None) -> bool:
+# ---------- ФИЛЬТР ПО КЛЮЧЕВЫМ СЛОВАМ ----------
+
+def is_relevant_by_keywords(text: str) -> bool:
     if not text:
         return False
     t = text.lower()
@@ -243,13 +283,13 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
             if channel_username:
                 msg_link = f"https://t.me/{channel_username}/{message.id}"
             else:
-                msg_link = f"https://t.me/{normalized}"
+                msg_link = None
 
-            sender_username = None
             try:
-                if message.sender and getattr(message.sender, "username", None):
-                    sender_username = message.sender.username
+                sender = await message.get_sender()
+                sender_username = getattr(sender, "username", None)
             except Exception:
+                sender = None
                 sender_username = None
 
             payload = {
@@ -307,7 +347,7 @@ async def run_loop_async():
             return
 
     async with aiohttp.ClientSession() as http:
-        # СНАЧАЛА пытаемся взять сессию из миниаппа
+        # СНАЧАЛА пытаемся взять сессию из miniаппа
         current_session = await fetch_secret(http, "tg_session")
         if current_session:
             logger.info("🔑 Используем TG StringSession из miniapp (длина %d символов)", len(current_session))
@@ -396,7 +436,6 @@ async def run_loop_async():
 def main():
     logger.info("🚀 Запуск Telegram Job Parser (без интерактивного логина)")
     asyncio.run(run_loop_async())
-
 
 
 if __name__ == "__main__":
