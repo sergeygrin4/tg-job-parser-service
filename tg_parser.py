@@ -307,9 +307,19 @@ async def run_loop_async():
             return
 
     async with aiohttp.ClientSession() as http:
-        current_session = SESSION_STRING or await fetch_secret(http, "tg_session")
-        if not current_session:
-            logger.error("❌ Не удалось получить TG StringSession ни из env, ни из miniapp")
+        # СНАЧАЛА пытаемся взять сессию из миниаппа
+        current_session = await fetch_secret(http, "tg_session")
+        if current_session:
+            logger.info("🔑 Используем TG StringSession из miniapp (длина %d символов)", len(current_session))
+        elif SESSION_STRING:
+            # Фоллбек: env, если в miniapp ещё ничего нет
+            current_session = SESSION_STRING
+            logger.warning(
+                "⚠️ В miniapp пока нет tg_session, используем TG_SESSION/TELEGRAM_SESSION/SESSION из env (длина %d символов)",
+                len(current_session),
+            )
+        else:
+            logger.error("❌ Не удалось получить TG StringSession ни из miniapp, ни из env")
             send_alert(
                 "Telegram парсер не стартовал: нет StringSession.\n"
                 "Открой миниапп → ⚙️ Настройки → Аккаунты → Telegram сессия и создай/вставь сессию."
@@ -324,7 +334,10 @@ async def run_loop_async():
                     "Пересоздай сессию в миниаппе (⚙️ Настройки → Аккаунты)."
                 )
                 await asyncio.sleep(60)
-                current_session = SESSION_STRING or await fetch_secret(http, "tg_session") or current_session
+                # ещё раз пробуем взять из miniapp
+                new_session = await fetch_secret(http, "tg_session")
+                if new_session:
+                    current_session = new_session
                 continue
 
             try:
@@ -339,8 +352,10 @@ async def run_loop_async():
                     )
                     await _post_status(http, "tg_auth_required", "true")
                     await asyncio.sleep(60)
-                    new_session = SESSION_STRING or await fetch_secret(http, "tg_session")
+                    # пробуем получить новую сессию из miniapp
+                    new_session = await fetch_secret(http, "tg_session")
                     if new_session and new_session != current_session:
+                        logger.warning("🔄 Получена новая TG StringSession из miniapp после ошибки авторизации")
                         current_session = new_session
                     continue
 
@@ -348,9 +363,10 @@ async def run_loop_async():
                 logger.info("✅ Telegram клиент авторизован")
 
                 while True:
-                    new_session = SESSION_STRING or await fetch_secret(http, "tg_session")
+                    # проверяем, не обновилась ли сессия в miniapp
+                    new_session = await fetch_secret(http, "tg_session")
                     if new_session and new_session != current_session:
-                        logger.warning("🔄 TG session updated in miniapp — reconnect")
+                        logger.warning("🔄 TG session обновилась в miniapp — переподключаемся")
                         current_session = new_session
                         break
 
@@ -380,6 +396,7 @@ async def run_loop_async():
 def main():
     logger.info("🚀 Запуск Telegram Job Parser (без интерактивного логина)")
     asyncio.run(run_loop_async())
+
 
 
 if __name__ == "__main__":
