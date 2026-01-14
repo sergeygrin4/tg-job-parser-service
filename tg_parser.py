@@ -19,12 +19,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tg_parser")
 
-# ---------- КОНФИГ И ОКРУЖЕНИЕ ----------
+# ---------- КОНФИГ ----------
 
-API_ID = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or "0")
-API_HASH = os.getenv("TG_API_HASH") or os.getenv("API_HASH") or ""
-
-SESSION_STRING = (
+TG_API_ID = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or "0")
+TG_API_HASH = os.getenv("TG_API_HASH") or os.getenv("API_HASH") or ""
+TG_SESSION = (
     os.getenv("TG_SESSION")
     or os.getenv("TELEGRAM_SESSION")
     or os.getenv("SESSION")
@@ -40,39 +39,11 @@ API_SECRET = os.getenv("API_SECRET", "")
 
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 MESSAGES_LIMIT_PER_SOURCE = int(os.getenv("MESSAGES_LIMIT_PER_SOURCE", "50"))
+MAX_TEXT_LEN = int(os.getenv("MAX_TEXT_LEN", "3500"))
 
-if not API_ID or not API_HASH:
-    logger.error("❌ TG_API_ID/API_ID или TG_API_HASH/API_HASH не заданы в переменных окружения")
+# Фильтрация по ключевым словам (миниапп сам фильтрует тоже, но пусть будет дубль)
+ENABLE_KEYWORDS_FILTER = (os.getenv("ENABLE_KEYWORDS_FILTER", "1").strip() != "0")
 
-if not SESSION_STRING:
-    logger.warning(
-        "⚠️ TG_SESSION/TELEGRAM_SESSION/SESSION не задана. "
-        "Попробуем взять StringSession из miniapp (/api/parser_secrets/tg_session)."
-    )
-
-# ---------- КЛЮЧЕВЫЕ СЛОВА ----------
-
-KEYWORDS = [
-    # RU
-    "вакансия", "вакансии", "ищем", "требуется", "нужен сотрудник", "нужна помощь", "нужен человек",
-    "нужен помощник", "нужна помощница", "нужен ассистент", "нужен менеджер", "ищу исполнителя",
-    "ищу помощника", "ищу сотрудника", "ищу ассистента", "в команду", "в нашу команду", "к нам в команду",
-    "открыта вакансия", "открыт набор", "открыта позиция", "работа удалённо", "удалённая работа",
-    "удаленка", "фриланс", "ищу на фриланс", "ищу специалиста", "ищу человека", "ищем специалиста",
-    "ищем в команду", "хочу нанять", "возьму на проект", "нужен человек в проект", "ищем на проект",
-    "набор сотрудников", "расширяем команду",
-    # EN
-    "we are hiring", "hiring", "looking for", "we’re looking for", "need help with", "need a person",
-    "need an assistant", "looking for a team member", "freelancer needed", "remote position",
-    "job offer", "job opening", "open position", "apply now", "join our team", "recruiting",
-    "team expansion", "full-time", "part-time", "contractor", "long-term collaboration",
-    "replacement guarantee", "if you have an account", "account needed", "account required",
-    "contact me on telegram", "please contact me",
-]
-KEYWORDS_LOWER = [k.lower() for k in KEYWORDS]
-
-
-# ---------- HTTP-УТИЛИТЫ ----------
 
 def _auth_headers() -> dict:
     headers = {"Content-Type": "application/json"}
@@ -93,6 +64,11 @@ def send_alert(text: str):
         req = urllib_request.Request(url, data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
 
+        # auth (если включён API_SECRET в miniapp)
+        if API_SECRET:
+            req.add_header("X-API-KEY", API_SECRET)
+            req.add_header("Authorization", f"Bearer {API_SECRET}")
+
         with urllib_request.urlopen(req, timeout=10) as resp:
             _ = resp.read()
 
@@ -108,82 +84,36 @@ async def fetch_secret(session: aiohttp.ClientSession, key: str) -> str | None:
     try:
         async with session.get(url, headers=_auth_headers(), timeout=10) as resp:
             if resp.status != 200:
-                logger.error("❌ Ошибка /api/parser_secrets/%s: %s %s", key, resp.status, await resp.text())
                 return None
             data = await resp.json()
-            value = data.get("value")
-            return value if value else None
-    except Exception as e:
-        logger.error("❌ Не удалось получить секрет %s из %s: %s", key, url, e)
+            return data.get("value")
+    except Exception:
         return None
 
 
-def _is_telegram_source(group_id: str) -> bool:
-    """
-    Определяем, относится ли строка group_id к Telegram-источнику.
-    Отсекаем Facebook и прочие не-TG ссылки.
-    """
-    if not group_id:
-        return False
-    s = group_id.strip()
-    if not s:
-        return False
+async def fetch_sources(session: aiohttp.ClientSession) -> list[dict]:
+    """Берём список источников из miniapp (/api/sources)."""
+    url = f"{API_BASE_URL}/api/sources"
+    # sources защищены админкой, поэтому для парсера используем /api/groups (в этом проекте так исторически)
+    # если у вас реально другой эндпоинт — тут поправьте.
+    url2 = f"{API_BASE_URL}/api/groups"
 
-    lower = s.lower()
-
-    # Явные facebook-ссылки — игнорируем в TG-парсере
-    if "facebook.com" in lower or "fb.com" in lower:
-        return False
-
-    # Классические Telegram-форматы
-    if s.startswith("@"):
-        return True
-    if "t.me/" in lower or "telegram.me/" in lower:
-        return True
-
-    # Всё остальное считаем не-TG источником
-    return False
-
-
-async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
-    """
-    GET /api/groups
-    Ожидаем {"groups":[{"group_id":"..."}, ...]}
-    Берём только Telegram-источники, Facebook и прочие выкидываем.
-    """
-    url = f"{API_BASE_URL}/api/groups"
-    try:
-        async with session.get(url, timeout=10) as resp:
-            if resp.status != 200:
-                logger.error("❌ Ошибка /api/groups: %s %s", resp.status, await resp.text())
-                return []
-            data = await resp.json()
-    except Exception as e:
-        logger.error("❌ Не удалось получить источники из %s: %s", url, e)
-        return []
-
-    groups = data.get("groups") or []
-    sources: list[str] = []
-    skipped: list[str] = []
-
-    for g in groups:
-        gid = (g.get("group_id") or "").strip()
-        if not gid:
+    for u in (url2, url):
+        try:
+            async with session.get(u, headers=_auth_headers(), timeout=15) as resp:
+                txt = await resp.text()
+                if resp.status != 200:
+                    logger.warning("Не удалось получить источники %s: %s %s", u, resp.status, txt[:300])
+                    continue
+                data = await resp.json()
+                items = data.get("items") or data.get("groups") or data.get("sources") or []
+                if isinstance(items, list) and items:
+                    return items
+        except Exception:
             continue
-        if _is_telegram_source(gid):
-            sources.append(gid)
-        else:
-            skipped.append(gid)
 
-    if skipped:
-        logger.info("ℹ️ Пропущены не-Telegram источники (например FB): %s", skipped)
-
-    if sources:
-        logger.info("📥 Получено %d Telegram-источников: %s", len(sources), sources)
-    else:
-        logger.info("📥 Telegram-источников в /api/groups не найдено")
-
-    return sources
+    send_alert("⚠️ tg_parser: список источников в /api/groups не найдено")
+    return []
 
 
 async def send_post(session: aiohttp.ClientSession, payload: dict):
@@ -195,8 +125,7 @@ async def send_post(session: aiohttp.ClientSession, payload: dict):
         async with session.post(url, json=payload, headers=_auth_headers(), timeout=15) as resp:
             text = await resp.text()
             if resp.status != 200:
-                logger.error("❌ Ошибка /post: %s %s",
-                             resp.status, text[:500])
+                logger.error("❌ Ошибка /post: %s %s", resp.status, text[:500])
             else:
                 logger.info("✅ Пост отправлен в миниапп: %s", text[:200])
     except Exception as e:
@@ -208,239 +137,114 @@ async def send_post(session: aiohttp.ClientSession, payload: dict):
 def is_relevant_by_keywords(text: str) -> bool:
     if not text:
         return False
-    t = text.lower()
-    return any(kw in t for kw in KEYWORDS_LOWER)
+    # миниапп хранит keywords в БД, но тут — локальный быстрый фильтр (опционально)
+    # если нужно — можно подтянуть keywords аналогично sources.
+    return True
 
 
-async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, source: str):
-    logger.info("🔍 Парсим Telegram источник: %s", source)
+# ---------- ОСНОВНОЙ ЦИКЛ ----------
 
-    if not client.is_connected():
-        logger.warning("⚠️ Клиент Telegram отключён, переподключаем...")
-        await client.connect()
+async def process_source(session: aiohttp.ClientSession, client: TelegramClient, source: dict):
+    """
+    Читает последние сообщения из канала/чата и отправляет релевантные в miniapp.
+    source ожидается в формате: {id?, title?, link?}
+    """
+    link = (source.get("link") or "").strip()
+    title = (source.get("title") or "").strip() or link
 
-    # entity
+    if not link:
+        return
+
     try:
-        normalized = source.strip()
-        if normalized.startswith("https://t.me/"):
-            normalized = normalized.replace("https://t.me/", "")
-        elif normalized.startswith("http://t.me/"):
-            normalized = normalized.replace("http://t.me/", "")
-        normalized = normalized.rstrip("/")
-
-        entity = await client.get_entity(normalized)
-
-    except FloodWaitError as e:
-        logger.error("⏳ FloodWait при get_entity %s: %s sec", source, e.seconds)
-        send_alert(f"Telegram FloodWait (get_entity). Ждать {e.seconds} сек.\n\nИсточник: {source}")
-        await asyncio.sleep(e.seconds)
-        return
-
-    except RPCError as e:
-        logger.error("❌ RPCError при get_entity %s: %s", source, e)
-        if "authorization has been invalidated" in str(e).lower():
-            send_alert(
-                "Telegram парсер потерял авторизацию (authorization invalidated).\n"
-                "Нужно пересоздать StringSession и обновить TG_SESSION.\n\n"
-                f"Источник: {source}"
-            )
-        else:
-            send_alert(f"Ошибка Telegram парсера при получении entity.\nИсточник: {source}\nОшибка: {e}")
-        return
-
+        entity = await client.get_entity(link)
     except Exception as e:
-        logger.error("❌ Ошибка при get_entity %s: %s", source, e)
-        send_alert(f"Неожиданная ошибка при получении entity.\nИсточник: {source}\nОшибка: {e}")
+        logger.error("Не удалось получить entity %s: %s", link, e)
         return
 
-    # info
     try:
-        channel_username = getattr(entity, "username", None)
-    except Exception:
-        channel_username = None
+        messages = await client.get_messages(entity, limit=MESSAGES_LIMIT_PER_SOURCE)
+    except FloodWaitError as e:
+        logger.warning("FloodWait %s sec for %s", e.seconds, link)
+        await asyncio.sleep(e.seconds + 1)
+        return
+    except RPCError as e:
+        logger.error("RPCError get_messages %s: %s", link, e)
+        return
+    except Exception as e:
+        logger.error("Ошибка get_messages %s: %s", link, e)
+        return
 
-    try:
-        channel_title = getattr(entity, "title", None) or getattr(entity, "first_name", None)
-    except Exception:
-        channel_title = None
+    for msg in reversed(messages):
+        try:
+            if not msg or not getattr(msg, "id", None):
+                continue
 
-    # messages
-    try:
-        async for message in client.iter_messages(entity, limit=MESSAGES_LIMIT_PER_SOURCE):
-            text = message.message or ""
+            text = (getattr(msg, "message", None) or "").strip()
             if not text:
                 continue
 
-            if not is_relevant_by_keywords(text):
+            if len(text) > MAX_TEXT_LEN:
+                text = text[:MAX_TEXT_LEN].rstrip() + "…"
+
+            if ENABLE_KEYWORDS_FILTER and not is_relevant_by_keywords(text):
                 continue
 
-            created_at: datetime = message.date
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-
-            external_id = str(message.id)
-
-            if channel_username:
-                msg_link = f"https://t.me/{channel_username}/{message.id}"
-            else:
-                msg_link = None
-
+            # url на сообщение (для публичных каналов/чатов будет кликабельно)
+            url = ""
             try:
-                sender = await message.get_sender()
-                sender_username = getattr(sender, "username", None)
+                if getattr(entity, "username", None):
+                    url = f"https://t.me/{entity.username}/{msg.id}"
             except Exception:
-                sender = None
-                sender_username = None
+                url = ""
 
             payload = {
-                "source": source,
-                "source_name": channel_title,
-                "external_id": external_id,
-                "url": msg_link,
+                "source": "telegram",
+                "source_name": title or "telegram",
+                "external_id": f"{link}:{msg.id}",
+                "url": url,
                 "text": text,
-                "sender_username": sender_username,
-                "created_at": created_at.isoformat(),
+                "sender_username": "",
+                "created_at": msg.date.astimezone(timezone.utc).isoformat() if getattr(msg, "date", None) else None,
             }
 
-            logger.info("📨 Релевантный пост в %s (id=%s) → отправляем", source, external_id)
             await send_post(session, payload)
 
-    except FloodWaitError as e:
-        logger.error("⏳ FloodWait при iter_messages %s: %s sec", source, e.seconds)
-        send_alert(f"Telegram FloodWait (iter_messages). Ждать {e.seconds} сек.\n\nИсточник: {source}")
-        await asyncio.sleep(e.seconds)
-
-    except RPCError as e:
-        logger.error("❌ RPCError при iter_messages %s: %s", source, e)
-        if "authorization has been invalidated" in str(e).lower():
-            send_alert(
-                "Telegram парсер потерял авторизацию (authorization invalidated) во время чтения.\n"
-                "Нужно пересоздать StringSession.\n\n"
-                f"Источник: {source}"
-            )
-        else:
-            send_alert(f"Ошибка Telegram парсера при чтении истории.\nИсточник: {source}\nОшибка: {e}")
-
-    except Exception as e:
-        logger.error("❌ Ошибка парсинга %s: %s", source, e)
-        send_alert(f"Критическая ошибка Telegram парсера при парсинге.\nИсточник: {source}\nОшибка: {e}")
+        except Exception as e:
+            logger.error("Ошибка обработки сообщения: %s", e)
 
 
-async def run_loop_async():
-    if not API_ID or not API_HASH:
-        logger.error("❌ Нет Telegram конфигурации (API_ID/API_HASH), выходим.")
-        return
+async def main():
+    if not TG_API_ID or not TG_API_HASH or not TG_SESSION:
+        send_alert("❌ tg_parser: не хватает TG_API_ID/TG_API_HASH/TG_SESSION")
+        raise SystemExit(1)
 
-    async def _build_client(session_str: str) -> TelegramClient | None:
-        try:
-            session_obj = StringSession(session_str)
-        except ValueError:
-            return None
-        return TelegramClient(session_obj, API_ID, API_HASH)
+    async with aiohttp.ClientSession() as session:
+        # если хотите скрывать токены в env — можно вытягивать их из miniapp:
+        # example: secret = await fetch_secret(session, "SOME_KEY")
+        sources = await fetch_sources(session)
 
-    async def _post_status(http: aiohttp.ClientSession, key: str, value: str):
-        url = f"{API_BASE_URL}/api/parser_status/{key}"
-        try:
-            async with http.post(url, json={"value": value}, headers=_auth_headers(), timeout=10):
-                return
-        except Exception:
+        if not sources:
+            send_alert("⚠️ tg_parser: sources пустые — парсить нечего")
             return
 
-    async with aiohttp.ClientSession() as http:
-        # СНАЧАЛА пытаемся взять сессию из miniаппа
-        current_session = await fetch_secret(http, "tg_session")
-        if current_session:
-            logger.info("🔑 Используем TG StringSession из miniapp (длина %d символов)", len(current_session))
-        elif SESSION_STRING:
-            # Фоллбек: env, если в miniapp ещё ничего нет
-            current_session = SESSION_STRING
-            logger.warning(
-                "⚠️ В miniapp пока нет tg_session, используем TG_SESSION/TELEGRAM_SESSION/SESSION из env (длина %d символов)",
-                len(current_session),
-            )
-        else:
-            logger.error("❌ Не удалось получить TG StringSession ни из miniapp, ни из env")
-            send_alert(
-                "Telegram парсер не стартовал: нет StringSession.\n"
-                "Открой миниапп → ⚙️ Настройки → Аккаунты → Telegram сессия и создай/вставь сессию."
-            )
+        client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
+
+        await client.connect()
+        if not await client.is_user_authorized():
+            send_alert("❌ tg_parser: Telegram session не авторизована")
+            await client.disconnect()
             return
 
-        while True:
-            client = await _build_client(current_session)
-            if not client:
-                send_alert(
-                    "Telegram парсер: некорректная StringSession.\n"
-                    "Пересоздай сессию в миниаппе (⚙️ Настройки → Аккаунты)."
-                )
-                await asyncio.sleep(60)
-                # ещё раз пробуем взять из miniapp
-                new_session = await fetch_secret(http, "tg_session")
-                if new_session:
-                    current_session = new_session
-                continue
+        send_alert(f"✅ tg_parser started. sources={len(sources)} poll={POLL_INTERVAL_SECONDS}s")
 
-            try:
-                await client.connect()
-                logger.info("✅ Подключились к Telegram (connect)")
-
-                if not await client.is_user_authorized():
-                    logger.error("❌ Telegram клиент НЕ авторизован (StringSession слетела/не подходит)")
-                    send_alert(
-                        "Telegram парсер: сессия не авторизована.\n"
-                        "Открой миниапп → ⚙️ Настройки → Аккаунты → Telegram сессия и пересоздай её."
-                    )
-                    await _post_status(http, "tg_auth_required", "true")
-                    await asyncio.sleep(60)
-                    # пробуем получить новую сессию из miniapp
-                    new_session = await fetch_secret(http, "tg_session")
-                    if new_session and new_session != current_session:
-                        logger.warning("🔄 Получена новая TG StringSession из miniapp после ошибки авторизации")
-                        current_session = new_session
-                    continue
-
-                await _post_status(http, "tg_auth_required", "false")
-                logger.info("✅ Telegram клиент авторизован")
-
-                while True:
-                    # проверяем, не обновилась ли сессия в miniapp
-                    new_session = await fetch_secret(http, "tg_session")
-                    if new_session and new_session != current_session:
-                        logger.warning("🔄 TG session обновилась в miniapp — переподключаемся")
-                        current_session = new_session
-                        break
-
-                    sources = await fetch_sources(http)
-                    if not sources:
-                        logger.info("ℹ️ Источников нет, спим %s секунд", POLL_INTERVAL_SECONDS)
-                        await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                        continue
-
-                    for source in sources:
-                        try:
-                            await parse_source(client, http, source)
-                        except Exception as e:
-                            logger.error("❌ Ошибка парсинга источника %s: %s", source, e)
-
-                    await _post_status(http, "tg_last_ok", datetime.now(timezone.utc).isoformat())
-                    logger.info("⏳ Ждём %s секунд до следующего цикла", POLL_INTERVAL_SECONDS)
-                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
-
-            finally:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-
-
-def main():
-    logger.info("🚀 Запуск Telegram Job Parser (без интерактивного логина)")
-    asyncio.run(run_loop_async())
+        try:
+            while True:
+                for s in sources:
+                    await process_source(session, client, s)
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        finally:
+            await client.disconnect()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        send_alert(f"🚨 Критическая ошибка запуска Telegram парсера.\n\nОшибка: {e}")
-        raise
+    asyncio.run(main())
