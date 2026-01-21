@@ -35,7 +35,18 @@ API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
 if not API_BASE_URL:
     API_BASE_URL = "https://telegram-job-parser-production.up.railway.app"
 
-API_SECRET = (os.getenv("API_SECRET") or "").strip()
+def _get_api_secret() -> str:
+    """Backwards-compatible secret lookup."""
+    return (
+        os.getenv("API_SECRET")
+        or os.getenv("MINIAPP_API_SECRET")
+        or os.getenv("X_API_KEY")
+        or os.getenv("PARSER_API_SECRET")
+        or ""
+    ).strip()
+
+
+API_SECRET = _get_api_secret()
 
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 MESSAGES_LIMIT_PER_SOURCE = int(os.getenv("MESSAGES_LIMIT_PER_SOURCE", "50"))
@@ -99,10 +110,16 @@ def send_alert(text: str):
         with urllib_request.urlopen(req, timeout=10) as resp:
             _ = resp.read()
 
-    except (HTTPError, URLError, TimeoutError):
-        pass
-    except Exception:
-        pass
+    except HTTPError as e:
+        try:
+            body = (e.read() or b"").decode("utf-8", "ignore")
+        except Exception:
+            body = ""
+        logger.error("❌ /api/alert HTTPError %s body=%s", getattr(e, "code", "?"), body[:500])
+    except (URLError, TimeoutError) as e:
+        logger.error("❌ /api/alert network error: %s", e)
+        except Exception:
+        logger.exception("❌ /api/alert exception")
 
 
 async def fetch_secret(session: aiohttp.ClientSession, key: str) -> str | None:
@@ -145,7 +162,7 @@ async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
     """
     url = f"{API_BASE_URL}/api/groups"
     try:
-        async with session.get(url, timeout=10) as resp:
+        async with session.get(url, headers=_auth_headers(), timeout=10) as resp:
             if resp.status != 200:
                 logger.error("❌ Ошибка /api/groups: %s %s", resp.status, await resp.text())
                 return []
