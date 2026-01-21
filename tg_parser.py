@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import json
-from datetime import datetime, timezone
+from datetime import timezone
 from urllib import request as urllib_request
 from urllib.error import URLError, HTTPError
 
@@ -34,6 +34,7 @@ SESSION_STRING = (
 API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
 if not API_BASE_URL:
     API_BASE_URL = "https://telegram-job-parser-production.up.railway.app"
+
 
 def _get_api_secret() -> str:
     """Backwards-compatible secret lookup."""
@@ -92,7 +93,7 @@ def _auth_headers() -> dict:
     return headers
 
 
-def send_alert(text: str):
+def send_alert(text: str) -> None:
     """
     Системный алерт в миниапп: POST /api/alert
     Без requests, только urllib (stdlib).
@@ -116,9 +117,11 @@ def send_alert(text: str):
         except Exception:
             body = ""
         logger.error("❌ /api/alert HTTPError %s body=%s", getattr(e, "code", "?"), body[:500])
+
     except (URLError, TimeoutError) as e:
         logger.error("❌ /api/alert network error: %s", e)
-        except Exception:
+
+    except Exception:
         logger.exception("❌ /api/alert exception")
 
 
@@ -195,7 +198,7 @@ async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
     return sources
 
 
-async def send_post(session: aiohttp.ClientSession, payload: dict):
+async def send_post(session: aiohttp.ClientSession, payload: dict) -> None:
     url = f"{API_BASE_URL}/post"
     try:
         async with session.post(url, json=payload, headers=_auth_headers(), timeout=15) as resp:
@@ -215,7 +218,7 @@ def is_relevant_by_keywords(text: str) -> bool:
     return any(kw in t for kw in KEYWORDS_LOWER)
 
 
-async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, source: str):
+async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, source: str) -> None:
     logger.info("🔍 Парсим Telegram источник: %s", source)
 
     if not client.is_connected():
@@ -279,7 +282,7 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
             logger.error("❌ Ошибка обработки сообщения: %s", e)
 
 
-async def main():
+async def main() -> None:
     if not API_ID or not API_HASH:
         send_alert("❌ tg_parser: не хватает TG_API_ID/TG_API_HASH")
         raise SystemExit(1)
