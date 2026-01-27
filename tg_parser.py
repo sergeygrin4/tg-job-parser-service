@@ -20,8 +20,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tg_parser")
 
-
-# ---------- ENV / CONFIG ----------
+# ---------- КОНФИГ И ОКРУЖЕНИЕ ----------
 
 def _env_first(*names: str, default: str = "") -> str:
     for n in names:
@@ -37,7 +36,7 @@ API_HASH = _env_first("TG_API_HASH", "API_HASH", default="")
 SESSION_STRING = _env_first("TG_SESSION", "TELEGRAM_SESSION", "SESSION", default="")
 
 # IMPORTANT:
-# User stores miniapp url in `miniapp_url` (Railway variable). Support both cases + legacy names.
+# miniapp URL у тебя хранится в Railway variable `miniapp_url`.
 API_BASE_URL = _env_first(
     "MINIAPP_URL",
     "miniapp_url",
@@ -61,8 +60,8 @@ def _get_api_secret() -> str:
 API_SECRET = _get_api_secret()
 
 # Polling:
-# - If POLL_INTERVAL_SECONDS is set => fixed.
-# - Else => random between MIN/MAX (defaults 50-60 minutes).
+# - If POLL_INTERVAL_SECONDS is set => fixed interval
+# - Else => random between MIN/MAX (defaults 50–60 minutes)
 POLL_INTERVAL_SECONDS_RAW = _env_first("POLL_INTERVAL_SECONDS", default="").strip()
 POLL_INTERVAL_MIN_SECONDS = int(_env_first("POLL_INTERVAL_MIN_SECONDS", default="3000") or "3000")
 POLL_INTERVAL_MAX_SECONDS = int(_env_first("POLL_INTERVAL_MAX_SECONDS", default="3600") or "3600")
@@ -70,38 +69,8 @@ POLL_INTERVAL_MAX_SECONDS = int(_env_first("POLL_INTERVAL_MAX_SECONDS", default=
 MESSAGES_LIMIT_PER_SOURCE = int(_env_first("MESSAGES_LIMIT_PER_SOURCE", default="50") or "50")
 MAX_TEXT_LEN = int(_env_first("MAX_TEXT_LEN", default="3500") or "3500")
 
-
-def _auth_headers() -> dict:
-    headers = {"Content-Type": "application/json"}
-    if API_SECRET:
-        # miniapp checks X-API-KEY and/or Authorization: Bearer
-        headers["X-API-KEY"] = API_SECRET
-        headers["Authorization"] = f"Bearer {API_SECRET}"
-    return headers
-
-
-def _next_sleep_seconds() -> int:
-    if POLL_INTERVAL_SECONDS_RAW:
-        try:
-            return max(1, int(POLL_INTERVAL_SECONDS_RAW))
-        except Exception:
-            return 3000
-
-    lo = max(1, int(POLL_INTERVAL_MIN_SECONDS))
-    hi = max(lo, int(POLL_INTERVAL_MAX_SECONDS))
-    return random.randint(lo, hi)
-
-
-def _poll_hint() -> str:
-    if POLL_INTERVAL_SECONDS_RAW:
-        return f"{_next_sleep_seconds()}s (fixed)"
-    return f"{POLL_INTERVAL_MIN_SECONDS}-{POLL_INTERVAL_MAX_SECONDS}s (jitter)"
-
-
 if not API_BASE_URL:
-    logger.error(
-        "❌ miniapp_url/MINIAPP_URL не задан. Укажи Railway variable miniapp_url=... (URL miniapp сервиса)."
-    )
+    logger.error("❌ miniapp_url/MINIAPP_URL не задан. Укажи Railway variable miniapp_url=... (URL miniapp сервиса).")
 
 if not API_ID or not API_HASH:
     logger.error("❌ TG_API_ID/API_ID или TG_API_HASH/API_HASH не заданы в переменных окружения")
@@ -113,74 +82,49 @@ if not SESSION_STRING:
     )
 
 
+def _auth_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    if API_SECRET:
+        headers["X-API-KEY"] = API_SECRET
+        headers["Authorization"] = f"Bearer {API_SECRET}"
+    return headers
+
+
+def _next_sleep_seconds() -> int:
+    if POLL_INTERVAL_SECONDS_RAW:
+        try:
+            return max(1, int(POLL_INTERVAL_SECONDS_RAW))
+        except Exception:
+            return 3000
+    lo = max(1, int(POLL_INTERVAL_MIN_SECONDS))
+    hi = max(lo, int(POLL_INTERVAL_MAX_SECONDS))
+    return random.randint(lo, hi)
+
+
+def _poll_hint() -> str:
+    if POLL_INTERVAL_SECONDS_RAW:
+        return f"{_next_sleep_seconds()}s (fixed)"
+    return f"{POLL_INTERVAL_MIN_SECONDS}-{POLL_INTERVAL_MAX_SECONDS}s (jitter)"
+
+
 # ---------- КЛЮЧЕВЫЕ СЛОВА ----------
 
 KEYWORDS = [
     # RU
-    "вакансия",
-    "вакансии",
-    "ищем",
-    "требуется",
-    "нужен сотрудник",
-    "нужна помощь",
-    "нужен человек",
-    "нужен помощник",
-    "нужна помощница",
-    "нужен ассистент",
-    "нужен менеджер",
-    "ищу исполнителя",
-    "ищу помощника",
-    "ищу сотрудника",
-    "ищу ассистента",
-    "в команду",
-    "в нашу команду",
-    "к нам в команду",
-    "открыта вакансия",
-    "открыт набор",
-    "открыта позиция",
-    "работа удалённо",
-    "удалённая работа",
-    "удаленка",
-    "фриланс",
-    "ищу на фриланс",
-    "ищу специалиста",
-    "ищу человека",
-    "ищем специалиста",
-    "ищем в команду",
-    "хочу нанять",
-    "возьму на проект",
-    "нужен человек в проект",
-    "ищем на проект",
-    "набор сотрудников",
-    "расширяем команду",
+    "вакансия", "вакансии", "ищем", "требуется", "нужен сотрудник", "нужна помощь", "нужен человек",
+    "нужен помощник", "нужна помощница", "нужен ассистент", "нужен менеджер", "ищу исполнителя",
+    "ищу помощника", "ищу сотрудника", "ищу ассистента", "в команду", "в нашу команду", "к нам в команду",
+    "открыта вакансия", "открыт набор", "открыта позиция", "работа удалённо", "удалённая работа",
+    "удаленка", "фриланс", "ищу на фриланс", "ищу специалиста", "ищу человека", "ищем специалиста",
+    "ищем в команду", "хочу нанять", "возьму на проект", "нужен человек в проект", "ищем на проект",
+    "набор сотрудников", "расширяем команду",
     # EN
-    "we are hiring",
-    "hiring",
-    "looking for",
-    "we’re looking for",
-    "need help with",
-    "need a person",
-    "need an assistant",
-    "looking for a team member",
-    "freelancer needed",
-    "remote position",
-    "job offer",
-    "job opening",
-    "open position",
-    "apply now",
-    "join our team",
-    "recruiting",
-    "team expansion",
-    "full-time",
-    "part-time",
-    "contractor",
-    "long-term collaboration",
-    "replacement guarantee",
-    "if you have an account",
-    "account needed",
-    "account required",
-    "contact me on telegram",
-    "please contact me",
+    "we are hiring", "hiring", "looking for", "we’re looking for", "need help with", "need a person",
+    "need an assistant", "looking for a team member", "freelancer needed", "remote position",
+    "job offer", "job opening", "open position", "apply now", "join our team", "recruiting",
+    "team expansion", "full-time", "part-time", "contractor", "long-term collaboration",
+    "replacement guarantee", "if you have an account", "account needed", "account required",
+    "contact me on telegram", "please contact me",
 ]
 KEYWORDS_LOWER = [k.lower() for k in KEYWORDS]
 
@@ -190,9 +134,8 @@ KEYWORDS_LOWER = [k.lower() for k in KEYWORDS]
 def send_alert(text: str) -> None:
     """Системный алерт в миниапп: POST /api/alert (urllib, stdlib)."""
     if not API_BASE_URL:
-        logger.error("❌ send_alert skipped (no API_BASE_URL): %s", text)
+        logger.error("❌ send_alert skipped (no miniapp_url): %s", text)
         return
-
     try:
         url = f"{API_BASE_URL}/api/alert"
         payload = json.dumps({"source": "tg_parser", "message": text, "text": text}).encode("utf-8")
@@ -224,7 +167,6 @@ async def fetch_secret(session: aiohttp.ClientSession, key: str) -> str | None:
     """Берём секрет из miniapp (/api/parser_secrets/<key>)."""
     if not API_BASE_URL:
         return None
-
     url = f"{API_BASE_URL}/api/parser_secrets/{key}"
     try:
         async with session.get(url, headers=_auth_headers(), timeout=10) as resp:
@@ -248,7 +190,7 @@ def _is_telegram_source(group_id: str) -> bool:
     lower = s.lower()
     if "facebook.com" in lower or "fb.com" in lower:
         return False
-    if s.startswith("@"):  # @channel
+    if s.startswith("@"):
         return True
     if "t.me/" in lower or "telegram.me/" in lower:
         return True
@@ -256,10 +198,9 @@ def _is_telegram_source(group_id: str) -> bool:
 
 
 async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
-    """GET /api/groups -> {"groups":[{"group_id":"..."}, ...]}"""
+    """GET /api/groups, берём только Telegram-источники."""
     if not API_BASE_URL:
         return []
-
     url = f"{API_BASE_URL}/api/groups"
     try:
         async with session.get(url, headers=_auth_headers(), timeout=10) as resp:
@@ -297,9 +238,8 @@ async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
 
 async def send_post(session: aiohttp.ClientSession, payload: dict) -> None:
     if not API_BASE_URL:
-        logger.error("❌ send_post skipped (no API_BASE_URL)")
+        logger.error("❌ send_post skipped (no miniapp_url)")
         return
-
     url = f"{API_BASE_URL}/post"
     try:
         async with session.post(url, json=payload, headers=_auth_headers(), timeout=20) as resp:
