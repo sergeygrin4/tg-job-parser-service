@@ -1,15 +1,16 @@
 import asyncio
+import json
 import logging
 import os
-import json
+import random
 from datetime import timezone
 from urllib import request as urllib_request
-from urllib.error import URLError, HTTPError
+from urllib.error import HTTPError, URLError
 
 import aiohttp
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
-from telethon.errors import RPCError, FloodWaitError
 
 # ---------- ЛОГГЕР ----------
 
@@ -19,39 +20,88 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tg_parser")
 
-# ---------- КОНФИГ И ОКРУЖЕНИЕ ----------
 
-API_ID = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or "0")
-API_HASH = os.getenv("TG_API_HASH") or os.getenv("API_HASH") or ""
+# ---------- ENV / CONFIG ----------
 
-SESSION_STRING = (
-    os.getenv("TG_SESSION")
-    or os.getenv("TELEGRAM_SESSION")
-    or os.getenv("SESSION")
-    or ""
-)
+def _env_first(*names: str, default: str = "") -> str:
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
 
-API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
-if not API_BASE_URL:
-    API_BASE_URL = "https://telegram-job-parser-production.up.railway.app"
+
+API_ID = int(_env_first("TG_API_ID", "API_ID", default="0") or "0")
+API_HASH = _env_first("TG_API_HASH", "API_HASH", default="")
+
+SESSION_STRING = _env_first("TG_SESSION", "TELEGRAM_SESSION", "SESSION", default="")
+
+# IMPORTANT:
+# User stores miniapp url in `miniapp_url` (Railway variable). Support both cases + legacy names.
+API_BASE_URL = _env_first(
+    "MINIAPP_URL",
+    "miniapp_url",
+    "API_BASE_URL",  # legacy
+    "API_URL",
+    default="",
+).rstrip("/")
 
 
 def _get_api_secret() -> str:
     """Backwards-compatible secret lookup."""
-    return (
-        os.getenv("API_SECRET")
-        or os.getenv("MINIAPP_API_SECRET")
-        or os.getenv("X_API_KEY")
-        or os.getenv("PARSER_API_SECRET")
-        or ""
+    return _env_first(
+        "API_SECRET",
+        "MINIAPP_API_SECRET",
+        "X_API_KEY",
+        "PARSER_API_SECRET",
+        default="",
     ).strip()
 
 
 API_SECRET = _get_api_secret()
 
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
-MESSAGES_LIMIT_PER_SOURCE = int(os.getenv("MESSAGES_LIMIT_PER_SOURCE", "50"))
-MAX_TEXT_LEN = int(os.getenv("MAX_TEXT_LEN", "3500"))
+# Polling:
+# - If POLL_INTERVAL_SECONDS is set => fixed.
+# - Else => random between MIN/MAX (defaults 50-60 minutes).
+POLL_INTERVAL_SECONDS_RAW = _env_first("POLL_INTERVAL_SECONDS", default="").strip()
+POLL_INTERVAL_MIN_SECONDS = int(_env_first("POLL_INTERVAL_MIN_SECONDS", default="3000") or "3000")
+POLL_INTERVAL_MAX_SECONDS = int(_env_first("POLL_INTERVAL_MAX_SECONDS", default="3600") or "3600")
+
+MESSAGES_LIMIT_PER_SOURCE = int(_env_first("MESSAGES_LIMIT_PER_SOURCE", default="50") or "50")
+MAX_TEXT_LEN = int(_env_first("MAX_TEXT_LEN", default="3500") or "3500")
+
+
+def _auth_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    if API_SECRET:
+        # miniapp checks X-API-KEY and/or Authorization: Bearer
+        headers["X-API-KEY"] = API_SECRET
+        headers["Authorization"] = f"Bearer {API_SECRET}"
+    return headers
+
+
+def _next_sleep_seconds() -> int:
+    if POLL_INTERVAL_SECONDS_RAW:
+        try:
+            return max(1, int(POLL_INTERVAL_SECONDS_RAW))
+        except Exception:
+            return 3000
+
+    lo = max(1, int(POLL_INTERVAL_MIN_SECONDS))
+    hi = max(lo, int(POLL_INTERVAL_MAX_SECONDS))
+    return random.randint(lo, hi)
+
+
+def _poll_hint() -> str:
+    if POLL_INTERVAL_SECONDS_RAW:
+        return f"{_next_sleep_seconds()}s (fixed)"
+    return f"{POLL_INTERVAL_MIN_SECONDS}-{POLL_INTERVAL_MAX_SECONDS}s (jitter)"
+
+
+if not API_BASE_URL:
+    logger.error(
+        "❌ miniapp_url/MINIAPP_URL не задан. Укажи Railway variable miniapp_url=... (URL miniapp сервиса)."
+    )
 
 if not API_ID or not API_HASH:
     logger.error("❌ TG_API_ID/API_ID или TG_API_HASH/API_HASH не заданы в переменных окружения")
@@ -62,45 +112,90 @@ if not SESSION_STRING:
         "Попробуем взять StringSession из miniapp (/api/parser_secrets/tg_session)."
     )
 
+
 # ---------- КЛЮЧЕВЫЕ СЛОВА ----------
 
 KEYWORDS = [
     # RU
-    "вакансия", "вакансии", "ищем", "требуется", "нужен сотрудник", "нужна помощь", "нужен человек",
-    "нужен помощник", "нужна помощница", "нужен ассистент", "нужен менеджер", "ищу исполнителя",
-    "ищу помощника", "ищу сотрудника", "ищу ассистента", "в команду", "в нашу команду", "к нам в команду",
-    "открыта вакансия", "открыт набор", "открыта позиция", "работа удалённо", "удалённая работа",
-    "удаленка", "фриланс", "ищу на фриланс", "ищу специалиста", "ищу человека", "ищем специалиста",
-    "ищем в команду", "хочу нанять", "возьму на проект", "нужен человек в проект", "ищем на проект",
-    "набор сотрудников", "расширяем команду",
+    "вакансия",
+    "вакансии",
+    "ищем",
+    "требуется",
+    "нужен сотрудник",
+    "нужна помощь",
+    "нужен человек",
+    "нужен помощник",
+    "нужна помощница",
+    "нужен ассистент",
+    "нужен менеджер",
+    "ищу исполнителя",
+    "ищу помощника",
+    "ищу сотрудника",
+    "ищу ассистента",
+    "в команду",
+    "в нашу команду",
+    "к нам в команду",
+    "открыта вакансия",
+    "открыт набор",
+    "открыта позиция",
+    "работа удалённо",
+    "удалённая работа",
+    "удаленка",
+    "фриланс",
+    "ищу на фриланс",
+    "ищу специалиста",
+    "ищу человека",
+    "ищем специалиста",
+    "ищем в команду",
+    "хочу нанять",
+    "возьму на проект",
+    "нужен человек в проект",
+    "ищем на проект",
+    "набор сотрудников",
+    "расширяем команду",
     # EN
-    "we are hiring", "hiring", "looking for", "we’re looking for", "need help with", "need a person",
-    "need an assistant", "looking for a team member", "freelancer needed", "remote position",
-    "job offer", "job opening", "open position", "apply now", "join our team", "recruiting",
-    "team expansion", "full-time", "part-time", "contractor", "long-term collaboration",
-    "replacement guarantee", "if you have an account", "account needed", "account required",
-    "contact me on telegram", "please contact me",
+    "we are hiring",
+    "hiring",
+    "looking for",
+    "we’re looking for",
+    "need help with",
+    "need a person",
+    "need an assistant",
+    "looking for a team member",
+    "freelancer needed",
+    "remote position",
+    "job offer",
+    "job opening",
+    "open position",
+    "apply now",
+    "join our team",
+    "recruiting",
+    "team expansion",
+    "full-time",
+    "part-time",
+    "contractor",
+    "long-term collaboration",
+    "replacement guarantee",
+    "if you have an account",
+    "account needed",
+    "account required",
+    "contact me on telegram",
+    "please contact me",
 ]
 KEYWORDS_LOWER = [k.lower() for k in KEYWORDS]
 
+
 # ---------- HTTP-УТИЛИТЫ ----------
 
-def _auth_headers() -> dict:
-    headers = {"Content-Type": "application/json"}
-    if API_SECRET:
-        headers["X-API-KEY"] = API_SECRET
-        headers["Authorization"] = f"Bearer {API_SECRET}"
-    return headers
-
-
 def send_alert(text: str) -> None:
-    """
-    Системный алерт в миниапп: POST /api/alert
-    Без requests, только urllib (stdlib).
-    """
+    """Системный алерт в миниапп: POST /api/alert (urllib, stdlib)."""
+    if not API_BASE_URL:
+        logger.error("❌ send_alert skipped (no API_BASE_URL): %s", text)
+        return
+
     try:
         url = f"{API_BASE_URL}/api/alert"
-        payload = json.dumps({"source": "tg_parser", "message": text}).encode("utf-8")
+        payload = json.dumps({"source": "tg_parser", "message": text, "text": text}).encode("utf-8")
 
         req = urllib_request.Request(url, data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
@@ -127,6 +222,9 @@ def send_alert(text: str) -> None:
 
 async def fetch_secret(session: aiohttp.ClientSession, key: str) -> str | None:
     """Берём секрет из miniapp (/api/parser_secrets/<key>)."""
+    if not API_BASE_URL:
+        return None
+
     url = f"{API_BASE_URL}/api/parser_secrets/{key}"
     try:
         async with session.get(url, headers=_auth_headers(), timeout=10) as resp:
@@ -150,7 +248,7 @@ def _is_telegram_source(group_id: str) -> bool:
     lower = s.lower()
     if "facebook.com" in lower or "fb.com" in lower:
         return False
-    if s.startswith("@"):
+    if s.startswith("@"):  # @channel
         return True
     if "t.me/" in lower or "telegram.me/" in lower:
         return True
@@ -158,11 +256,10 @@ def _is_telegram_source(group_id: str) -> bool:
 
 
 async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
-    """
-    GET /api/groups
-    Ожидаем {"groups":[{"group_id":"..."}, ...]}
-    Берём только Telegram-источники, Facebook и прочие выкидываем.
-    """
+    """GET /api/groups -> {"groups":[{"group_id":"..."}, ...]}"""
+    if not API_BASE_URL:
+        return []
+
     url = f"{API_BASE_URL}/api/groups"
     try:
         async with session.get(url, headers=_auth_headers(), timeout=10) as resp:
@@ -191,7 +288,7 @@ async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
         logger.info("ℹ️ Пропущены не-Telegram источники (например FB): %s", skipped)
 
     if sources:
-        logger.info("📥 Получено %d Telegram-источников: %s", len(sources), sources)
+        logger.info("📥 Получено %d Telegram-источников", len(sources))
     else:
         logger.info("📥 Telegram-источников в /api/groups не найдено")
 
@@ -199,9 +296,13 @@ async def fetch_sources(session: aiohttp.ClientSession) -> list[str]:
 
 
 async def send_post(session: aiohttp.ClientSession, payload: dict) -> None:
+    if not API_BASE_URL:
+        logger.error("❌ send_post skipped (no API_BASE_URL)")
+        return
+
     url = f"{API_BASE_URL}/post"
     try:
-        async with session.post(url, json=payload, headers=_auth_headers(), timeout=15) as resp:
+        async with session.post(url, json=payload, headers=_auth_headers(), timeout=20) as resp:
             text = await resp.text()
             if resp.status != 200:
                 logger.error("❌ Ошибка /post: %s %s", resp.status, text[:500])
@@ -283,6 +384,9 @@ async def parse_source(client: TelegramClient, session: aiohttp.ClientSession, s
 
 
 async def main() -> None:
+    if not API_BASE_URL:
+        raise SystemExit(1)
+
     if not API_ID or not API_HASH:
         send_alert("❌ tg_parser: не хватает TG_API_ID/TG_API_HASH")
         raise SystemExit(1)
@@ -296,11 +400,6 @@ async def main() -> None:
             send_alert("❌ tg_parser: TG_SESSION пустая и tg_session не найден в miniapp")
             raise SystemExit(1)
 
-        sources = await fetch_sources(session)
-        if not sources:
-            send_alert("⚠️ tg_parser: sources пустые — парсить нечего")
-            return
-
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
         await client.connect()
@@ -309,13 +408,20 @@ async def main() -> None:
             await client.disconnect()
             return
 
-        send_alert(f"✅ tg_parser started. sources={len(sources)} poll={POLL_INTERVAL_SECONDS}s")
+        send_alert(f"✅ tg_parser started. poll={_poll_hint()}")
 
         try:
             while True:
-                for s in sources:
-                    await parse_source(client, session, s)
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                sources = await fetch_sources(session)
+                if not sources:
+                    send_alert("⚠️ tg_parser: sources пустые — парсить нечего")
+                else:
+                    for s in sources:
+                        await parse_source(client, session, s)
+
+                sleep_s = _next_sleep_seconds()
+                logger.info("⏲️ sleep %ss", sleep_s)
+                await asyncio.sleep(sleep_s)
         finally:
             await client.disconnect()
 
