@@ -12,7 +12,6 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - tg_parser - %(levelname)s - %(message)s",
@@ -21,7 +20,7 @@ logger = logging.getLogger("tg_parser")
 
 
 # -----------------------------
-# Config / ENV (same style as fb_parser)
+# ENV helpers
 # -----------------------------
 def _env_first(*names: str, default: str = "") -> str:
     for n in names:
@@ -31,6 +30,9 @@ def _env_first(*names: str, default: str = "") -> str:
     return default
 
 
+# -----------------------------
+# Miniapp config
+# -----------------------------
 API_BASE_URL = _env_first(
     "MINIAPP_URL",
     "miniapp_url",
@@ -63,16 +65,43 @@ def _auth_headers() -> dict:
     return headers
 
 
+TG_GROUPS_API_URL = (os.getenv("TG_GROUPS_API_URL") or f"{API_BASE_URL}/api/groups").strip()
+
 TG_API_ID = int(_env_first("TG_API_ID", "TG_API_ID_DEFAULT", "API_ID", default="0") or "0")
 TG_API_HASH = _env_first("TG_API_HASH", "TG_API_HASH_DEFAULT", "API_HASH", default="")
 
-TG_GROUPS_API_URL = (os.getenv("TG_GROUPS_API_URL") or f"{API_BASE_URL}/api/groups").strip()
+# сколько новых сообщений максимум обрабатывать за один цикл на один источник
+TG_NEW_MESSAGES_LIMIT = int(_env_first("TG_NEW_MESSAGES_LIMIT", default="50") or "50")
 
+# warm start: чтобы при первом запуске НЕ тащил историю
+WARM_START = (_env_first("TG_WARM_START", default="true").lower() in ("1", "true", "yes", "y"))
+
+# polling
 POLL_INTERVAL_SECONDS_RAW = _env_first("POLL_INTERVAL_SECONDS", default="").strip()
 POLL_INTERVAL_MIN_SECONDS = int(_env_first("POLL_INTERVAL_MIN_SECONDS", default="60") or "60")
 POLL_INTERVAL_MAX_SECONDS = int(_env_first("POLL_INTERVAL_MAX_SECONDS", default="180") or "180")
 
-TG_MESSAGE_LIMIT = int(_env_first("TG_MESSAGE_LIMIT", default="30") or "30")
+# keywords
+JOB_KEYWORDS_RAW = _env_first("JOB_KEYWORDS", default="").strip()
+
+
+def _parse_keywords(raw: str) -> list[str]:
+    # поддержим и запятые, и точки с запятой, и переносы строк
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    parts = re.split(r"[,\n;]+", raw)
+    out = []
+    for p in parts:
+        p = p.strip().lower()
+        if not p:
+            continue
+        out.append(p)
+    # uniq preserving order
+    return list(dict.fromkeys(out))
+
+
+JOB_KEYWORDS = _parse_keywords(JOB_KEYWORDS_RAW)
 
 
 def _next_sleep_seconds() -> int:
@@ -84,6 +113,82 @@ def _next_sleep_seconds() -> int:
     lo = max(1, int(POLL_INTERVAL_MIN_SECONDS))
     hi = max(lo, int(POLL_INTERVAL_MAX_SECONDS))
     return random.randint(lo, hi)
+
+
+# -----------------------------
+# Optional GPT filter (OpenAI)
+# -----------------------------
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
+OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+GPT_ENABLED = bool(OPENAI_API_KEY) and (_env_first("GPT_ENABLED", default="true").lower() in ("1", "true", "yes", "y"))
+
+# ограничим длину текста в GPT, чтобы не жечь токены
+GPT_TEXT_MAX = int(_env_first("GPT_TEXT_MAX", default="2500") or "2500")
+
+
+def gpt_is_relevant(text: str) -> tuple[bool, str]:
+    """
+    Возвращает (relevant, reason).
+    Если GPT выключен — считаем, что релевантно (после keyword-фильтра).
+    """
+    if not GPT_ENABLED:
+        return True, "gpt_disabled"
+
+    t = (text or "").strip()
+    if len(t) > GPT_TEXT_MAX:
+        t = t[:GPT_TEXT_MAX].rstrip() + "…"
+
+    prompt = (
+        "Ты фильтр вакансий.\n"
+        "Определи: это СООБЩЕНИЕ — реальная вакансия/поиск сотрудника/заказ на работу?\n"
+        "Важное:\n"
+        "- Если это просто обсуждение, новости, мемы, болтовня, ссылки без описания — НЕ релевантно.\n"
+        "- Если явно ищут сотрудника/исполнителя/ассистента/менеджера и т.п. — релевантно.\n"
+        "Ответь СТРОГО JSON без пояснений:\n"
+        '{"relevant": true/false, "reason": "коротко почему"}\n\n'
+        "Текст:\n"
+        f"{t}"
+    )
+
+    url = f"{OPENAI_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": "Ты аккуратно отвечаешь строго валидным JSON."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        if r.status_code >= 400:
+            return True, f"gpt_http_{r.status_code}"  # чтобы не дропать всё из-за gpt
+        data = r.json() or {}
+        content = (
+            (data.get("choices") or [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+        # иногда модель оборачивает в ```json
+        content = re.sub(r"^```json\s*", "", content)
+        content = re.sub(r"\s*```$", "", content)
+
+        import json as _json
+
+        obj = _json.loads(content)
+        rel = bool(obj.get("relevant"))
+        reason = str(obj.get("reason") or "").strip()[:200]
+        return rel, reason or "ok"
+    except Exception as e:
+        # если GPT упал — лучше пропустить, чем спамить “всё не релевантно”
+        return True, f"gpt_error:{type(e).__name__}"
 
 
 # -----------------------------
@@ -140,10 +245,8 @@ def _looks_like_telegram(raw: str) -> bool:
         return True
     if "t.me/" in s or "telegram.me/" in s:
         return True
-    # allow bare channel/group usernames without @
     if re.fullmatch(r"[a-zA-Z0-9_]{4,}", s):
         return True
-    # numeric ids can exist, but in miniapp we rarely store them
     if re.fullmatch(r"-?\d+", s):
         return True
     return False
@@ -177,7 +280,6 @@ def fetch_telegram_sources() -> list[str]:
             continue
         out.append(raw)
 
-    # unique preserving order
     return list(dict.fromkeys(out))
 
 
@@ -186,16 +288,14 @@ def _normalize_tg_source(raw: str) -> str:
     if not s:
         return ""
 
-    # full url -> keep only username part when possible
     m = re.search(r"(?:t\.me|telegram\.me)/([a-zA-Z0-9_+\-]+)/?", s)
     if m:
         tail = m.group(1)
-        # t.me/+xxxxx is an invite (cannot fetch without join)
         if tail.startswith("+"):
+            # invite link: без join обычно не вытащим. Оставляем как есть.
             return s
         return "@" + tail.lstrip("@")
 
-    # username without @
     if re.fullmatch(r"[a-zA-Z0-9_]{4,}", s) and not s.startswith("@"):
         return "@" + s
 
@@ -203,7 +303,6 @@ def _normalize_tg_source(raw: str) -> str:
 
 
 def _external_id_from_message(msg: Any) -> str:
-    # stable across runs: peer + message id
     pid = None
     try:
         peer = getattr(msg, "peer_id", None)
@@ -245,100 +344,150 @@ def send_job_to_miniapp(
 
 
 # -----------------------------
-# Telegram parsing
+# Keyword match
 # -----------------------------
-async def _parse_one_source(client: TelegramClient, source_raw: str, seen: set[str]) -> int:
+def _keyword_match(text: str) -> bool:
+    if not JOB_KEYWORDS:
+        return False  # важно: если keywords не заданы — НИЧЕГО не шлём (иначе будет “весь чат”)
+    t = (text or "").lower()
+    return any(k in t for k in JOB_KEYWORDS)
+
+
+# -----------------------------
+# Parsing
+# -----------------------------
+async def _parse_one_source(
+    client: TelegramClient,
+    source_raw: str,
+    last_ids: dict[str, int],
+) -> tuple[int, int, int]:
+    """
+    Возвращает (new_msgs_seen, matched_by_keywords, sent_after_gpt)
+    """
     source = _normalize_tg_source(source_raw)
     if not source:
-        return 0
+        return 0, 0, 0
 
     try:
         entity = await client.get_entity(source)
     except Exception as e:
         logger.warning("⚠️ cannot resolve source=%r: %s", source_raw, e)
-        return 0
+        return 0, 0, 0
 
     username = getattr(entity, "username", None)
     title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or source_raw
-    source_name = title
+    source_name = str(title)
+
+    # ключ для словаря last_ids должен быть стабильный
+    entity_key = source_name + "|" + (username or source)
+
+    # warm start: при первом запуске — запоминаем текущий top id и НЕ шлём историю
+    if entity_key not in last_ids and WARM_START:
+        try:
+            latest = await client.get_messages(entity, limit=1)
+            if latest and latest[0]:
+                last_ids[entity_key] = int(latest[0].id)
+                logger.info("🔥 warm_start: %s last_id=%s", source_name, last_ids[entity_key])
+                return 0, 0, 0
+        except Exception:
+            last_ids[entity_key] = 0
+
+    min_id = int(last_ids.get(entity_key, 0) or 0)
+
+    new_seen = 0
+    kw_matched = 0
+    sent = 0
+    max_id_seen = min_id
 
     try:
-        msgs = await client.get_messages(entity, limit=TG_MESSAGE_LIMIT)
+        # reverse=True => от старых к новым (удобно обновлять last_id)
+        async for msg in client.iter_messages(entity, min_id=min_id, limit=TG_NEW_MESSAGES_LIMIT, reverse=True):
+            new_seen += 1
+            if msg.id and int(msg.id) > max_id_seen:
+                max_id_seen = int(msg.id)
+
+            text = (getattr(msg, "message", None) or getattr(msg, "text", None) or "").strip()
+            if not text:
+                continue
+
+            if not _keyword_match(text):
+                continue
+            kw_matched += 1
+
+            # GPT refine
+            ok, reason = gpt_is_relevant(text)
+            if not ok:
+                logger.info("🧹 gpt_drop (%s): %s", source_name, reason)
+                continue
+
+            dt = getattr(msg, "date", None)
+            created_at = None
+            if dt:
+                try:
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    created_at = dt.astimezone(timezone.utc).isoformat()
+                except Exception:
+                    created_at = None
+
+            url = None
+            if username:
+                url = f"https://t.me/{username}/{msg.id}"
+
+            sender_username = None
+            try:
+                sender = await msg.get_sender()
+                sender_username = getattr(sender, "username", None)
+                if sender_username:
+                    sender_username = "@" + sender_username.lstrip("@")
+            except Exception:
+                pass
+
+            ext_id = _external_id_from_message(msg)
+            send_job_to_miniapp(
+                text=text,
+                external_id=ext_id,
+                url=url,
+                created_at=created_at,
+                source_name=source_name,
+                sender_username=sender_username,
+            )
+            sent += 1
+
     except FloodWaitError as e:
         wait_s = int(getattr(e, "seconds", 0) or 0)
-        logger.warning("⏳ FloodWait on get_messages (%s): %ss", source_raw, wait_s)
+        logger.warning("⏳ FloodWait on %s: %ss", source_name, wait_s)
         await asyncio.sleep(wait_s + 1)
-        return 0
     except Exception as e:
-        logger.warning("⚠️ get_messages failed (%s): %s", source_raw, e)
-        return 0
+        logger.warning("⚠️ parse failed (%s): %s", source_name, e)
 
-    new_count = 0
-    for msg in msgs:
-        text = (getattr(msg, "message", None) or getattr(msg, "text", None) or "").strip()
-        if not text:
-            continue
-
-        ext_id = _external_id_from_message(msg)
-        if ext_id in seen:
-            continue
-
-        dt = getattr(msg, "date", None)
-        created_at = None
-        if dt:
-            try:
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                created_at = dt.astimezone(timezone.utc).isoformat()
-            except Exception:
-                created_at = None
-
-        url = None
-        if username:
-            url = f"https://t.me/{username}/{msg.id}"
-
-        sender_username = None
-        try:
-            sender = await msg.get_sender()
-            sender_username = getattr(sender, "username", None)
-            if sender_username:
-                sender_username = "@" + sender_username.lstrip("@")
-        except Exception:
-            pass
-
-        send_job_to_miniapp(
-            text=text,
-            external_id=ext_id,
-            url=url,
-            created_at=created_at,
-            source_name=str(source_name),
-            sender_username=sender_username,
-        )
-        seen.add(ext_id)
-        new_count += 1
-
-    return new_count
+    # обновляем last_id даже если ничего не отправили — иначе снова будем гонять одно и то же
+    last_ids[entity_key] = max(max_id_seen, min_id)
+    return new_seen, kw_matched, sent
 
 
 async def main() -> None:
     if not TG_API_ID or not TG_API_HASH:
         raise RuntimeError("TG_API_ID/TG_API_HASH is not set")
 
-    seen: set[str] = set()
-    seen_max = int(_env_first("SEEN_MAX", default="8000") or "8000")
+    if not JOB_KEYWORDS:
+        msg = (
+            "TG parser: JOB_KEYWORDS пустой — чтобы не спамить, парсер НИЧЕГО не будет отправлять.\n"
+            "Заполни JOB_KEYWORDS в Railway (через запятую)."
+        )
+        logger.error(msg)
+        post_status("tg_parser", "no_keywords")
+        send_alert(msg)
+
+    last_ids: dict[str, int] = {}
 
     last_session = ""
     client: TelegramClient | None = None
 
-    logger.info(
-        "✅ tg_parser started (poll=%ss, limit=%s)",
-        POLL_INTERVAL_SECONDS_RAW or f"{POLL_INTERVAL_MIN_SECONDS}-{POLL_INTERVAL_MAX_SECONDS}",
-        TG_MESSAGE_LIMIT,
-    )
+    logger.info("✅ tg_parser started (warm_start=%s, keywords=%s, gpt=%s)", WARM_START, len(JOB_KEYWORDS), GPT_ENABLED)
     send_alert("✅ tg_parser started.")
 
     while True:
-        # refresh session from miniapp (so admin can rotate it without redeploy)
         session_str = fetch_tg_session_from_miniapp() or _env_first("TG_SESSION", "TELEGRAM_SESSION", "SESSION", default="")
         session_str = (session_str or "").strip()
 
@@ -353,7 +502,6 @@ async def main() -> None:
             await asyncio.sleep(60)
             continue
 
-        # (re)connect client if session changed
         if client is None or session_str != last_session:
             if client is not None:
                 try:
@@ -381,17 +529,23 @@ async def main() -> None:
                 post_status("tg_parser", "no_sources")
             else:
                 total_new = 0
-                for s in sources:
-                    total_new += await _parse_one_source(client, s, seen)
+                total_kw = 0
+                total_sent = 0
 
-                post_status("tg_parser", f"ok new={total_new} sources={len(sources)}")
-                logger.info("✅ parsed: new=%s sources=%s", total_new, len(sources))
+                # если keywords пустые — просто читаем новые ids, но не шлём
+                if not JOB_KEYWORDS:
+                    for s in sources:
+                        await _parse_one_source(client, s, last_ids)
+                    post_status("tg_parser", f"no_keywords sources={len(sources)}")
+                else:
+                    for s in sources:
+                        new_seen, kw_matched, sent = await _parse_one_source(client, s, last_ids)
+                        total_new += new_seen
+                        total_kw += kw_matched
+                        total_sent += sent
 
-                # basic seen set cap
-                if len(seen) > seen_max:
-                    drop_n = max(1, len(seen) // 4)
-                    for x in list(seen)[:drop_n]:
-                        seen.discard(x)
+                    post_status("tg_parser", f"ok new={total_new} kw={total_kw} sent={total_sent} sources={len(sources)}")
+                    logger.info("✅ cycle: new=%s kw=%s sent=%s sources=%s", total_new, total_kw, total_sent, len(sources))
 
         except FloodWaitError as e:
             wait_s = int(getattr(e, "seconds", 0) or 0)
